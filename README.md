@@ -1,5 +1,4 @@
 **Repository Name**: Clipboard Image Saver for Windows  
-**Description**: 🖼️ Auto-save clipboard images to PNG with duplicate prevention. Uses MurmurHash for rapid processing and system integration controls.
 
 ---
 
@@ -24,7 +23,7 @@ A lightweight Windows utility that runs in the system tray and automatically:
 **Technical Highlights**:
 - MurmurHash3 implementation for efficient image fingerprinting
 - Sequential buffer comparison to prevent storage bloat
-- Low-memory footprint design (<2MB RAM typical usage)
+- Low-memory footprint design (<1MB RAM typical usage)
 
 **Use Cases**:
 - Automatically archive screenshots without duplicates
