@@ -20,18 +20,22 @@
 #define CONTROL         (2)
 
 // Define custom window message IDs
-#define WM_TRAYICON                  (WM_APP + 1)
+#define WM_APP_TRAYICON                (WM_APP + 1)
 
-// Define custom window message IDs
-#define IDI_NOTIFY_ICON              (WM_APP + 1)
+// Define custom icon IDs
+#define IDI_NOTIFY_ICON                (WM_APP + 1)
 
 // Define custom tray message IDs
-#define IDM_SHOW_BALLOON             (WM_APP + 5)
-#define IDM_RESTRICT_TO_SYSTEM       (WM_APP + 4)
-#define IDM_OPEN_FOLDER              (WM_APP + 3)
-#define IDM_TRAY_EXIT                (WM_APP + 2)
-#define IDM_TRAY_SEPARATOR           (WM_APP + 1)
+#define IDM_TRAY_SHOW_BALLOON          (WM_APP + 5)
+#define IDM_TRAY_RESTRICT_TO_SYSTEM    (WM_APP + 4)
+#define IDM_TRAY_OPEN_FOLDER           (WM_APP + 3)
+#define IDM_TRAY_EXIT                  (WM_APP + 2)
+#define IDM_TRAY_SEPARATOR             (WM_APP + 1)
 
+#ifndef PNG
+// Register clipboard format for PNG
+static UINT CF_PNG = RegisterClipboardFormat(_T("PNG"));
+#endif
 
 LPCTSTR g_mainName = _T("Clipboard Image Saver");
 LPCTSTR g_mainClassName = _T("CISClassname");
@@ -40,13 +44,6 @@ LPCTSTR MUTEX_NAME = _T("CISInstance");
 HWND g_hMainWnd{};
 HANDLE g_hMutex{};
 WNDCLASSEXW g_wcex{};
-HMENU g_hTrayContextMenu{};
-NOTIFYICONDATA g_notifyIconData{};
-
-// Register clipboard format for PNG
-static UINT CF_PNG = RegisterClipboardFormat(_T("PNG"));
-// Global GDI+
-ULONG_PTR g_gdiplusToken{};
 
 
 // Defines possible outcomes of clipboard data processing
@@ -65,37 +62,27 @@ enum class NotificationVariant {
 	Info,       // Standard notification
 	Warning,    // Important warning
 	Error,      // Critical error
-	Custom      // Custom message with parameters
+	Custom_OK,  // Custom message with parameters
+	Custom_NOT  // Custom message with parameters
 };
 
 
-inline void Cleanup()
-{
-	if (g_gdiplusToken) {
-		Gdiplus::GdiplusShutdown(g_gdiplusToken);
-	}
-	if (g_hMainWnd) {
-		RemoveClipboardFormatListener(g_hMainWnd);
-		DestroyWindow(g_hMainWnd);
-		UnregisterClass(g_wcex.lpszClassName, GetModuleHandle(NULL));
-	}
-	if (g_hMutex) {
-		ReleaseMutex(g_hMutex);
-		CloseHandle(g_hMutex);
-	}
-}
-
-inline void ForcedExit(LPCTSTR uMsg, DWORD error = ERROR_SUCCESS)
+inline DWORD ShowError(LPCTSTR sMessage, DWORD nError = ERROR_SUCCESS)
 {
 	TCHAR buffer[256]{};
-	_ftprintf(stderr, _T("%s ( %lu )\n"), uMsg, error);
-	MessageBox(NULL, buffer, _T("Error"), MB_OK | MB_ICONERROR);
 
-	Cleanup();
-	exit(error);
+	if (nError != ERROR_SUCCESS) {
+		_stprintf_s(buffer, _countof(buffer), _T("%s ( %lu )"), sMessage, nError);
+	}
+	else {
+		_tcscpy_s(buffer, _countof(buffer), sMessage);
+	}
+
+	MessageBox(NULL, buffer, _T("Error"), MB_OK | MB_ICONERROR);
+	return nError;
 }
 
-// 
+// Opens the specified folder in Windows Explorer.
 BOOL OpenFolderInExplorer(LPCTSTR folderPath)
 {
 	// Open the folder in Explorer
@@ -113,10 +100,10 @@ BOOL OpenFolderInExplorer(LPCTSTR folderPath)
 }
 
 // Fast 32-bit hash function (for binary data)
-UINT32 ComputeImageHash(LPCBYTE imageData, SIZE_T dataSize)
+UINT32 ComputeDataHash(LPCBYTE pData, SIZE_T dataSize)
 {
 	UINT32 seed = 0; // Fixed seed for consistency
-	UINT32 hash = MurmurHash3_32(imageData, dataSize, seed);
+	UINT32 hash = MurmurHash3_32(pData, dataSize, seed);
 	return hash;
 }
 
@@ -170,8 +157,6 @@ LPTSTR GenerateFilename()
 // Helper function to get the PNG encoder CLSID
 INT GetEncoderClsid(LPCTSTR format, CLSID* pClsid)
 {
-	if (!g_gdiplusToken) { return -1; }
-
 	UINT num{};
 	UINT pathSize{};
 
@@ -313,32 +298,29 @@ BOOL BitmapToDIB(HGLOBAL hClipboardData)
 }
 
 // Retrieves image data and its format from the clipboard
-HGLOBAL GetClipboardImageData(UINT* pFormat)
+HGLOBAL GetClipboardImageData(INT* pFormat)
 {
-	HGLOBAL hClipboardData = NULL;
-	HGLOBAL hCopy = NULL;
+	static UINT formatPriorityList[]{ CF_PNG, CF_DIBV5, CF_DIB, CF_BITMAP };
+
+	HGLOBAL hClipboardData{};
+	HGLOBAL hCopy{};
 	*pFormat = 0;
 
-	// Priority: PNG > DIBV5 > DIB > Bitmap
-	UINT formats[] = { CF_PNG, CF_DIBV5, CF_DIB, CF_BITMAP };
-	for (UINT fmt : formats) {
-		if (IsClipboardFormatAvailable(fmt)) {
-			hClipboardData = GetClipboardData(fmt);
-			if (hClipboardData) {
-				// Copy clipboard data to a new caller-owned handle
-				SIZE_T dataSize = GlobalSize(hClipboardData);
-				hCopy = GlobalAlloc(GMEM_MOVEABLE, dataSize);
-				if (hCopy) {
-					LPVOID pSrc = GlobalLock(hClipboardData);
-					LPVOID pDest = GlobalLock(hCopy);
-					if (pSrc && pDest) {
-						memcpy(pDest, pSrc, dataSize);
-						*pFormat = fmt;
-					}
-					GlobalUnlock(hClipboardData);
-					GlobalUnlock(hCopy);
+	INT nFormat = GetPriorityClipboardFormat(formatPriorityList, _countof(formatPriorityList));
+	if (nFormat) {
+		hClipboardData = GetClipboardData(nFormat);
+		if (hClipboardData) {
+			SIZE_T dataSize = GlobalSize(hClipboardData);
+			hCopy = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+			if (hCopy) {
+				LPVOID pSrc = GlobalLock(hClipboardData);
+				LPVOID pDest = GlobalLock(hCopy);
+				if (pSrc && pDest) {
+					memcpy(pDest, pSrc, dataSize);
+					*pFormat = nFormat;
 				}
-				break;
+				GlobalUnlock(hClipboardData);
+				GlobalUnlock(hCopy);
 			}
 		}
 	}
@@ -351,28 +333,29 @@ ClipboardResult HandleClipboardData(LPTSTR sFormat, UINT cChFormat)
 	static DWORD lastDataHash{};
 	static SIZE_T lastDataSize{};
 
-	UINT format{};
-	HGLOBAL hClipboardData = GetClipboardImageData(&format);
-	if (!hClipboardData) {
-		return ClipboardResult::NoData;
-	}
+	INT nFormat{};
+	HGLOBAL hClipboardData = GetClipboardImageData(&nFormat);
 
 	_tcscpy_s(sFormat, cChFormat, [&]() {
-		if (format == CF_PNG)    return _T("CF_PNG");
-		if (format == CF_DIBV5)  return _T("CF_DIBV5");
-		if (format == CF_DIB)    return _T("CF_DIB");
-		if (format == CF_BITMAP) return _T("CF_BITMAP");
-		                    else return _T("Unknown");
+		if (nFormat == CF_PNG)    return _T("PNG");
+		if (nFormat == CF_DIBV5)  return _T("DIBV5");
+		if (nFormat == CF_DIB)    return _T("DIB");
+		if (nFormat == CF_BITMAP) return _T("BITMAP");
+		else                      return _T("unknown");
 		}()
 	);
 
+	if (!hClipboardData or nFormat <= 0) {
+		return ClipboardResult::NoData;
+	}
+
 	// Convert CF_BITMAP to CF_DIB if needed
-	if (format == CF_BITMAP) {
+	if (nFormat == CF_BITMAP) {
 		if (!BitmapToDIB(hClipboardData)) {
 			GlobalFree(hClipboardData);
 			return ClipboardResult::ConversionFailed;
 		}
-		format = CF_DIB;
+		nFormat = CF_DIB;
 	}
 
 	LPBYTE pData = static_cast<LPBYTE>(GlobalLock(hClipboardData));
@@ -383,24 +366,24 @@ ClipboardResult HandleClipboardData(LPTSTR sFormat, UINT cChFormat)
 
 	// Calculate content hash
 	const SIZE_T dataSize = GlobalSize(hClipboardData);
-	const DWORD currentHash = ComputeImageHash(pData, dataSize);
+	const DWORD dataHash = ComputeDataHash(pData, dataSize);
 	GlobalUnlock(hClipboardData);
 
 	// Check for duplicate content
-	if (dataSize == lastDataSize && currentHash == lastDataHash) {
+	if (dataSize == lastDataSize && dataHash == lastDataHash) {
 		GlobalFree(hClipboardData);
 		return ClipboardResult::UnchangedContent;
 	}
 
 	// Generate filename and save
-	LPTSTR filename = GenerateFilename();
+	LPTSTR sFilename = GenerateFilename();
 	BOOL result{};
 
-	if (format == CF_PNG) {
-		result = SavePNGToFile(hClipboardData, filename);
+	if (nFormat == CF_PNG) {
+		result = SavePNGToFile(hClipboardData, sFilename);
 	}
 	else {
-		result = SaveDIBToFile(hClipboardData, filename);
+		result = SaveDIBToFile(hClipboardData, sFilename);
 	}
 
 	GlobalFree(hClipboardData);
@@ -410,114 +393,152 @@ ClipboardResult HandleClipboardData(LPTSTR sFormat, UINT cChFormat)
 	}
 
 	// Update state only after successful save
-	lastDataHash = currentHash;
+	lastDataHash = dataHash;
 	lastDataSize = dataSize;
 
 	return ClipboardResult::Success;
 }
 
 // Tray Icon initialization
-BOOL InitializeNotificationIcon(HWND hWnd, HICON* hIcon)
+BOOL InitializeNotificationIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* hIcon)
 {
 	// Load the icon
 	*hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_MAIN_ICON));
-	if (!*hIcon) return FALSE;
+	if (!*hIcon) { return FALSE; }
 
 	// Initialize NOTIFYICONDATA with modern settings
-	g_notifyIconData.cbSize = sizeof(NOTIFYICONDATA); // Use full structure size
-	g_notifyIconData.hWnd = hWnd;
-	g_notifyIconData.uID = IDI_NOTIFY_ICON;
-	g_notifyIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_INFO; // Modern flags
-	g_notifyIconData.uCallbackMessage = WM_TRAYICON;
-	g_notifyIconData.hIcon = *hIcon;
-	g_notifyIconData.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;  // For custom icons
-	_tcscpy_s(g_notifyIconData.szTip, g_mainName);
+	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA); // Use full structure size
+	pNotifyIconData->hWnd = hWnd;
+	pNotifyIconData->uID = IDI_NOTIFY_ICON;
+	pNotifyIconData->uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_INFO; // Modern flags
+	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;
+	pNotifyIconData->hIcon = *hIcon;
+	pNotifyIconData->dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;  // For custom icons
+	_tcscpy_s(pNotifyIconData->szTip, g_mainName);
 	// Required for Windows 10/11
-	g_notifyIconData.dwState = NIS_SHAREDICON;
-	g_notifyIconData.dwStateMask = NIS_SHAREDICON;
+	pNotifyIconData->dwState = NIS_SHAREDICON;
+	pNotifyIconData->dwStateMask = NIS_SHAREDICON;
 	// First add the icon to the tray
-	if (!Shell_NotifyIcon(NIM_ADD, &g_notifyIconData)) {
+	if (!Shell_NotifyIcon(NIM_ADD, pNotifyIconData)) {
 		return FALSE;
 	}
 	// Set version AFTER adding
-	g_notifyIconData.uVersion = NOTIFYICON_VERSION_4; // Use modern features
+	pNotifyIconData->uVersion = NOTIFYICON_VERSION_4; // Use modern features
 	//g_notifyIconData.uTimeout = 1000;  // 10 seconds (max allowed)
-	return Shell_NotifyIcon(NIM_SETVERSION, &g_notifyIconData);
+	return Shell_NotifyIcon(NIM_SETVERSION, pNotifyIconData);
 }
 
 // Initializes the GDI+ library for image processing
-void InitializeGDIPlus() {
+BOOL InitializeGDIPlus(ULONG_PTR* gdiplusToken)
+{
 	Gdiplus::GdiplusStartupInput startupInput;
-	Gdiplus::GdiplusStartup(&g_gdiplusToken, &startupInput, NULL);
+	return Gdiplus::GdiplusStartup(gdiplusToken, &startupInput, NULL) == Gdiplus::Status::Ok;
 }
 
 // Creates a popup menu for the system tray
-BOOL CreateTrayPopupMenu(HMENU* g_hTrayContextMenu)
+BOOL CreateTrayPopupMenu(HMENU* hTrayContextMenu)
 {
-	if (g_hTrayContextMenu) {
-		*g_hTrayContextMenu = CreatePopupMenu();
-		
-		if (*g_hTrayContextMenu) {
-			AppendMenu(*g_hTrayContextMenu, MF_STRING, IDM_OPEN_FOLDER,
-				_T("Open folder")
-			);
-			AppendMenu(*g_hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
-			AppendMenu(*g_hTrayContextMenu, MF_STRING | MF_CHECKED, IDM_RESTRICT_TO_SYSTEM,
-				_T("Restrict to System")
-			);
-			AppendMenu(*g_hTrayContextMenu, MF_STRING | MF_CHECKED, IDM_SHOW_BALLOON,
-				_T("Show notifications")
-			);
-			AppendMenu(*g_hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
-			AppendMenu(*g_hTrayContextMenu, MF_STRING, IDM_TRAY_EXIT,
-				_T("Exit")
-			);
-			AppendMenu(*g_hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
-			return *g_hTrayContextMenu != NULL;
-		}
+	if (!hTrayContextMenu) { return FALSE; }
+
+	*hTrayContextMenu = CreatePopupMenu();
+	if (!*hTrayContextMenu) {
+		return FALSE;
 	}
-	return FALSE;
+
+	AppendMenu(*hTrayContextMenu, MF_STRING, IDM_TRAY_OPEN_FOLDER,
+		_T("Open folder")
+	);
+	AppendMenu(*hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
+	AppendMenu(*hTrayContextMenu, MF_STRING | MF_CHECKED, IDM_TRAY_RESTRICT_TO_SYSTEM,
+		_T("Restrict to System")
+	);
+	AppendMenu(*hTrayContextMenu, MF_STRING | MF_CHECKED, IDM_TRAY_SHOW_BALLOON,
+		_T("Show notifications")
+	);
+	AppendMenu(*hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
+	AppendMenu(*hTrayContextMenu, MF_STRING, IDM_TRAY_EXIT,
+		_T("Exit")
+	);
+	AppendMenu(*hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
+
+	return *hTrayContextMenu != NULL;
 }
 
-// Main notification function
-void ShowBalloonNotification(NotificationVariant variant, LPCTSTR message = NULL, LPCTSTR details = NULL)
-{
-	if (!g_notifyIconData.hWnd) { return; }
+// Notification function
+BOOL ShowBalloonNotification(NOTIFYICONDATA* pNotifyIconData, NotificationVariant variant,
+	LPCTSTR sHeader, LPCTSTR sMessage = NULL, LPCTSTR sDetails = NULL
+){
+	if (!pNotifyIconData->hWnd) { return FALSE; }
 
-	g_notifyIconData.dwInfoFlags = [&]() {
+	pNotifyIconData->dwInfoFlags = [&]() {
 		switch (variant) {
-		case NotificationVariant::Warning: return NIIF_WARNING;
-		case NotificationVariant::Error:   return NIIF_ERROR;
-		default:                           return NIIF_INFO;
+		case NotificationVariant::Warning:  return NIIF_WARNING;
+		case NotificationVariant::Error:    return NIIF_ERROR;
+		default:                            return NIIF_INFO;
 		}
-		}();
+	}();
 
 	_tcscpy_s(
-		g_notifyIconData.szInfoTitle,
+		pNotifyIconData->szInfoTitle,
 		[&]() {
 			switch (variant) {
-			case NotificationVariant::Info:    return _T("Clipboard Data Captured");
-			case NotificationVariant::Custom:  return _T("Clipboard Data Ignored");
-			default:                           return _T("");
+			case NotificationVariant::Custom_OK:   return _T("Clipboard Data Captured");
+			case NotificationVariant::Custom_NOT:  return _T("Clipboard Data Ignored");
+			default:                               return sHeader ? sHeader : _T("");
 			}
 		}()
 	);
 
 	_stprintf_s(
-		g_notifyIconData.szInfo,
+		pNotifyIconData->szInfo,
 		[&]() {
 			switch (variant) {
-			case NotificationVariant::Info:    return _T("owner:  %s\nformat:  %s");
-			case NotificationVariant::Custom:  return _T("owner:  %s\nformat:  %s\nDuplicate sequence data detected");
-			case NotificationVariant::Warning: return _T("Caution: %s\n%s");
-			case NotificationVariant::Error:   return _T("Heads Up: %s\n%s");
-			default:                           return _T("");
+			case NotificationVariant::Custom_OK:   return _T("Owner:  %s\nType:  %s");
+			case NotificationVariant::Custom_NOT:  return _T("Owner:  %s\nType:  %s\nDuplicate sequence data detected");
+			default:                               return _T("%s\n%s");
 			}
 		}(),
-		message, details
+		sMessage ? sMessage : _T(""),
+		sDetails ? sDetails : _T("")
 	);
 
-	Shell_NotifyIcon(NIM_MODIFY, &g_notifyIconData);
+	return Shell_NotifyIcon(NIM_MODIFY, pNotifyIconData) == TRUE;
+}
+
+// Checks if the required time has elapsed since the last trigger time
+BOOL IsTimeElapsed(ULONGLONG requiredElapsedTime)
+{
+	static ULONGLONG previousTriggerTime{};
+	ULONGLONG currentSystemTime = GetTickCount64();
+
+	if (currentSystemTime < requiredElapsedTime + previousTriggerTime) {
+		return FALSE;
+	}
+	previousTriggerTime = currentSystemTime;
+
+	return TRUE;
+}
+
+// Attempts to open the clipboard with retry logic on access denial
+BOOL TryOpenClipboard()
+{
+	BOOL result = OpenClipboard(NULL);
+	if (result) {
+		return TRUE;
+	}
+
+	DWORD err = GetLastError();
+	if (err == ERROR_ACCESS_DENIED) { // Clipboard is being held by another process
+		// Retry logic with progressive backoff
+		INT retries = 4;
+		UINT delay = 50;  // ms
+
+		do {
+			Sleep(delay);
+			delay *= 2;  // Exponential backoff
+		} while (retries-- > 0 and !(result = OpenClipboard(NULL)));
+	}
+	return result;
 }
 
 
@@ -526,13 +547,29 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	// Data for the system tray icon
 	static HICON hIcon{};
+	static ULONG_PTR gdiplusToken{};
+	static NOTIFYICONDATA notifyIconData{};
+	static HMENU hTrayContextMenu{};
+
 
 	switch (uMsg)
 	{
 
 	case WM_CLIPBOARDUPDATE:
 	{
-		if (!OpenClipboard(hWnd)) {
+		// Debounce
+		const ULONGLONG minTimeBetweenUpdates = 50; // 50ms
+		if (!IsTimeElapsed(minTimeBetweenUpdates)) {
+			break;
+		}
+
+		if (!TryOpenClipboard()) {
+			ShowBalloonNotification(
+				&notifyIconData,
+				NotificationVariant::Error,
+				_T("Clipboard Error"),
+				_T("Failed to access clipboard")
+			);
 			break;
 		}
 
@@ -544,33 +581,55 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 
 		// Checks if the 'Restrict to System' option is enabled in the tray menu
-		if ((GetMenuState(g_hTrayContextMenu, IDM_RESTRICT_TO_SYSTEM, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED) {
+		if ((GetMenuState(hTrayContextMenu, IDM_TRAY_RESTRICT_TO_SYSTEM, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED) {
 			if (!CheckOwnerAllowed(clipboardOwner)) {
 				CloseClipboard();
 				break;
 			}
 		}
 
-		const UINT cChFormat = 64;
-		TCHAR sFormat[cChFormat];
-		// Attempts to process clipboard data
-		switch (HandleClipboardData(sFormat, cChFormat)) {
+		const UINT maxFormatStringLength = 64;
+		TCHAR clipboardFormatBuffer[maxFormatStringLength];
+		const BOOL isNotificationsAllowed = (GetMenuState(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED;
+
+		// Helper function for error cases
+		const auto HandleClipboardError = [&](LPCTSTR title, LPCTSTR message) {
+			if (isNotificationsAllowed) {
+				ShowBalloonNotification(&notifyIconData, NotificationVariant::Error, title, message);
+			}
+			CloseClipboard();
+			PostQuitMessage(-1);
+			};
+
+		// Helper function for success notifications
+		const auto ShowStatusNotification = [&](NotificationVariant variant) {
+			if (isNotificationsAllowed) {
+				ShowBalloonNotification(&notifyIconData, variant, _T(""), clipboardOwner, clipboardFormatBuffer);
+			}
+			};
+
+		switch (HandleClipboardData(clipboardFormatBuffer, maxFormatStringLength))
+		{
 		case ClipboardResult::Success:
-		{
-			// Displays a balloon notification if the 'Show Balloon' option is enabled
-			if ((GetMenuState(g_hTrayContextMenu, IDM_SHOW_BALLOON, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED) {
-				ShowBalloonNotification(NotificationVariant::Info, clipboardOwner, sFormat);
-			}
+			ShowStatusNotification(NotificationVariant::Custom_OK);
 			break;
-		}
+
 		case ClipboardResult::UnchangedContent:
-		{
-			// Displays a balloon notification if the 'Show Balloon' option is enabled
-			if ((GetMenuState(g_hTrayContextMenu, IDM_SHOW_BALLOON, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED) {
-				//ShowBalloonNotification(NotificationVariant::Custom, clipboardOwner, sFormat);
-			}
+			//ShowStatusNotification(NotificationVariant::Custom_NOT);
 			break;
-		}
+
+		case ClipboardResult::ConversionFailed:
+			HandleClipboardError(_T("Image Conversion Error"), _T("Failed to convert bitmap to DIB format"));
+			return -1;
+
+		case ClipboardResult::LockFailed:
+			HandleClipboardError(_T("Memory Error"), _T("Failed to lock clipboard memory"));
+			return -1;
+
+		case ClipboardResult::SaveFailed:
+			HandleClipboardError(_T("Save Error"), _T("Failed to save image to file"));
+			return -1;
+
 		default: break;
 		}
 
@@ -578,7 +637,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 
-	case WM_TRAYICON:
+	case WM_APP_TRAYICON:
 	{
 		switch (LOWORD(lParam))
 		{
@@ -592,7 +651,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			POINT cursorPosition;
 			GetCursorPos(&cursorPosition);
 			SetForegroundWindow(hWnd);
-			TrackPopupMenu(g_hTrayContextMenu, TPM_LEFTBUTTON, cursorPosition.x, cursorPosition.y, 0, hWnd, NULL);
+			TrackPopupMenu(hTrayContextMenu, TPM_LEFTBUTTON, cursorPosition.x, cursorPosition.y, 0, hWnd, NULL);
 			break;
 		}
 		default: break;
@@ -606,26 +665,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		{
 			if (LOWORD(wParam) == IDM_TRAY_EXIT) {
 				SendMessage(hWnd, WM_CLOSE, 0, 0);
+				break;
 			}
 
-			else if (LOWORD(wParam) == IDM_OPEN_FOLDER) {
+			if (LOWORD(wParam) == IDM_TRAY_OPEN_FOLDER) {
 				TCHAR dirPath[MAX_PATH]{};
 				GetCurrentDirectory(MAX_PATH, dirPath);
 
 				if (!OpenFolderInExplorer(dirPath)) {
-					MessageBox(NULL, _T("Failed to Open Image Path."), _T("Error"), MB_OK | MB_ICONERROR);
+					ShowBalloonNotification(
+						&notifyIconData,
+						NotificationVariant::Warning,
+						_T("Explorer Error"),
+						_T("Failed to open folder in File Explorer")
+					);
 				}
+				break;
 			}
 
-			else if (LOWORD(wParam) == IDM_RESTRICT_TO_SYSTEM) {
+			if (LOWORD(wParam) == IDM_TRAY_RESTRICT_TO_SYSTEM) {
 				// Switch checkbox
-				UINT menuItemState = GetMenuState(g_hTrayContextMenu, IDM_RESTRICT_TO_SYSTEM, MF_BYCOMMAND);
-				CheckMenuItem(g_hTrayContextMenu, IDM_RESTRICT_TO_SYSTEM, MF_BYCOMMAND | ((menuItemState & MF_CHECKED) ? MF_UNCHECKED : MF_CHECKED));
+				UINT menuItemState = GetMenuState(hTrayContextMenu, IDM_TRAY_RESTRICT_TO_SYSTEM, MF_BYCOMMAND);
+				CheckMenuItem(hTrayContextMenu, IDM_TRAY_RESTRICT_TO_SYSTEM, MF_BYCOMMAND | ((menuItemState & MF_CHECKED) ? MF_UNCHECKED : MF_CHECKED));
+				break;
 			}
-			else if (LOWORD(wParam) == IDM_SHOW_BALLOON) {
+
+			if (LOWORD(wParam) == IDM_TRAY_SHOW_BALLOON) {
 				// Switch checkbox
-				UINT menuItemState = GetMenuState(g_hTrayContextMenu, IDM_SHOW_BALLOON, MF_BYCOMMAND);
-				CheckMenuItem(g_hTrayContextMenu, IDM_SHOW_BALLOON, MF_BYCOMMAND | ((menuItemState & MF_CHECKED) ? MF_UNCHECKED : MF_CHECKED));
+				UINT menuItemState = GetMenuState(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON, MF_BYCOMMAND);
+				CheckMenuItem(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON, MF_BYCOMMAND | ((menuItemState & MF_CHECKED) ? MF_UNCHECKED : MF_CHECKED));
+				break;
 			}
 		}
 		break;
@@ -633,8 +702,53 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_CREATE:
 	{
-		InitializeNotificationIcon(hWnd, &hIcon);
-		CreateTrayPopupMenu(&g_hTrayContextMenu);
+		if (!InitializeGDIPlus(&gdiplusToken)) {
+			MessageBox(hWnd,
+				_T("Failed to initialize GDI+ library"),
+				_T("Initialization Error"),
+				MB_OK | MB_ICONERROR
+			);
+			return -1;
+		}
+
+		if (!InitializeNotificationIcon(&notifyIconData, hWnd, &hIcon)) {
+			MessageBox(hWnd,
+				_T("Failed to initialize system tray icon"),
+				_T("Tray Icon Error"),
+				MB_OK | MB_ICONERROR
+			);
+			return -1;
+		}
+
+		if (!CreateTrayPopupMenu(&hTrayContextMenu)) {
+			ShowBalloonNotification(
+				&notifyIconData,
+				NotificationVariant::Error,
+				_T("Tray Menu Error"),
+				_T("Failed to create system tray context menu")
+			);
+			return -1;
+		}
+
+		if (!AddClipboardFormatListener(hWnd)) {
+			ShowBalloonNotification(
+				&notifyIconData,
+				NotificationVariant::Error,
+				_T("Clipboard Error"),
+				_T("Failed to register clipboard listener")
+			);
+			return -1;
+		}
+
+		if (!CF_PNG) {
+			ShowBalloonNotification(
+				&notifyIconData,
+				NotificationVariant::Warning,
+				_T("Clipboard Format Error"),
+				_T("PNG format not available")
+			);
+		}
+
 		break;
 	}
 
@@ -646,16 +760,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_DESTROY:
 	{
-		Shell_NotifyIcon(NIM_DELETE, &g_notifyIconData);
-		// Delete notification icon
+		// Clean up system tray context menu
+		if (hTrayContextMenu) {
+			DestroyMenu(hTrayContextMenu);
+			hTrayContextMenu = NULL;
+		}
+
+		// Remove system tray icon
+		Shell_NotifyIcon(NIM_DELETE, &notifyIconData);
+
+		// Release tray icon resources
 		if (hIcon) {
 			DestroyIcon(hIcon);
 			hIcon = NULL;
 		}
-		// Destroy context menu
-		if (g_hTrayContextMenu) {
-			DestroyMenu(g_hTrayContextMenu);
-			g_hTrayContextMenu = NULL;
+
+		// Shutdown GDI+ if initialized
+		if (gdiplusToken) {
+			Gdiplus::GdiplusShutdown(gdiplusToken);
 		}
 
 		PostQuitMessage(0);
@@ -675,7 +797,8 @@ int _tmain(int argc, LPTSTR argv[])
 	// Single instance check
 	g_hMutex = CreateMutex(NULL, TRUE, MUTEX_NAME);
 	if (!g_hMutex) {
-		ForcedExit(_T("Error: Failed to get mutex.\n"), GetLastError());
+		ShowError(_T("Error: Failed to get mutex.\n"), GetLastError());
+		return 1;
 	}
 	DWORD mutexResult = GetLastError();
 	DWORD result{};
@@ -690,7 +813,8 @@ int _tmain(int argc, LPTSTR argv[])
 	g_wcex.hInstance = GetModuleHandle(NULL);
 	g_wcex.lpszClassName = g_mainClassName;
 	if (!RegisterClassEx(&g_wcex)) {
-		ForcedExit(_T("Error: Failed to register class.\n"), GetLastError());
+		ShowError(_T("Error: Failed to register class.\n"), GetLastError());
+		return 1;
 	}
 
 	g_hMainWnd = CreateWindowEx(
@@ -702,24 +826,32 @@ int _tmain(int argc, LPTSTR argv[])
 		NULL, NULL, NULL
 	);
 	if (!g_hMainWnd) {
-		ForcedExit(_T("Error: Failed to create window.\n"), GetLastError());
-	}
-
-	InitializeGDIPlus();
-
-	// Clipboard listener
-	if (!AddClipboardFormatListener(g_hMainWnd)) {
-		ForcedExit(_T("Error: Failed add clipboard listener.\n"), GetLastError());
+		ShowError(_T("Error: Failed to create window.\n"), GetLastError());
+		if (g_hMutex) {
+			ReleaseMutex(g_hMutex);
+			CloseHandle(g_hMutex);
+		}
+		return 1;
 	}
 
 	MSG msg;
 	while (GetMessage(&msg, NULL, 0, 0))
-		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
 
-	Cleanup();
+	// Cleanup
+	if (g_hMainWnd) {
+		RemoveClipboardFormatListener(g_hMainWnd);
+		DestroyWindow(g_hMainWnd);
+		UnregisterClass(g_wcex.lpszClassName, GetModuleHandle(NULL));
+	}
+	if (g_hMutex) {
+		ReleaseMutex(g_hMutex);
+		CloseHandle(g_hMutex);
+	}
+
 	return 0;
 }
 
