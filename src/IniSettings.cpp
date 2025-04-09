@@ -24,29 +24,29 @@ BOOL GetIniFilePath(LPTSTR lpBuffer, DWORD nBufferLength)
 }
 
 // Reads an integer value from the specified section and key in the INI file
-INT ReadIniInt(LPCTSTR section, LPCTSTR key, INT defaultValue, LPCTSTR iniPath)
+INT ReadIniInt(LPCTSTR section, LPCTSTR key, INT defaultValue, LPCTSTR configFilePath)
 {
-	return GetPrivateProfileInt(section, key, defaultValue, iniPath);
+	return GetPrivateProfileInt(section, key, defaultValue, configFilePath);
 }
 
 // Reads a string from the specified section and key in the INI file
-void ReadIniString(LPCTSTR section, LPCTSTR key, LPCTSTR defaultValue, LPTSTR buffer, DWORD bufferSize, LPCTSTR iniPath)
+void ReadIniString(LPCTSTR section, LPCTSTR key, LPCTSTR defaultValue, LPTSTR buffer, DWORD bufferSize, LPCTSTR configFilePath)
 {
-	GetPrivateProfileString(section, key, defaultValue, buffer, bufferSize, iniPath);
+	GetPrivateProfileString(section, key, defaultValue, buffer, bufferSize, configFilePath);
 }
 
 // Writes an integer value to the specified section and key in the INI file
-void WriteIniInt(LPCTSTR section, LPCTSTR key, INT value, LPCTSTR iniPath)
+void WriteIniInt(LPCTSTR section, LPCTSTR key, INT value, LPCTSTR configFilePath)
 {
 	TCHAR strValue[16];
 	_stprintf_s(strValue, _T("%d"), value);
-	WritePrivateProfileString(section, key, strValue, iniPath);
+	WritePrivateProfileString(section, key, strValue, configFilePath);
 }
 
 // Writes a string value to the specified section and key in the INI file
-void WriteIniString(LPCWSTR section, LPCWSTR key, LPCWSTR value, LPCWSTR iniPath)
+void WriteIniString(LPCWSTR section, LPCWSTR key, LPCWSTR value, LPCWSTR configFilePath)
 {
-	WritePrivateProfileString(section, key, value, iniPath);
+	WritePrivateProfileString(section, key, value, configFilePath);
 }
 
 

@@ -1,79 +1,144 @@
 #pragma once
-#include "resource.h"
-#include <windows.h>
-#include <tchar.h>
-#include <utility>  // std::forward
-#include <gdiplus.h>
-#include <shellapi.h>  // Shell_NotifyIcon
-#include "murmurhash3.h"  // Hash function
-#include <uxtheme.h>  // Themes support
-#include "IniSettings.h"
 
-#pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "uxtheme.lib")
-#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:wmainCRTStartup")
+// Windows system headers
+#include <windows.h>        // Core Windows API definitions (e.g., HWND, WPARAM, SendMessage)
+
+// Standard library headers
+#include <unordered_set>    // Provides std::unordered_set for efficient unique element storage
+#include <tchar.h>          // TCHAR support for Unicode/ANSI compatibility (e.g., _T macro)
+#include <type_traits>      // Provides std::underlying_type_t for enum bitwise operations
+#include <tuple>
 
 
 
-/*-----------------------------------------------------------------------------
- * MESSAGE SOURCES
- * Identifiers for different input sources in the application
- *----------------------------------------------------------------------------*/
-#define MENU            (0)    // Command originated from a menu
-#define ACCELERATOR     (1)    // Command originated from a keyboard accelerator
-#define CONTROL         (2)    // Command originated from a control
+// Define a custom end-of-line (EOL) sequence
+#define EOL_ "\r\n"
 
 
-/*-----------------------------------------------------------------------------
- * WINDOW MESSAGES
- * Custom window message IDs
- *----------------------------------------------------------------------------*/
-#define WM_APP_TRAYICON                (WM_APP + 1)  // Custom tray icon notification message
+// Forward declarations
+class IniSettings;
+class EditDialog;
 
 
-/*-----------------------------------------------------------------------------
- * RESOURCE IDENTIFIERS
- * Icons, menu items, and control identifiers
- *----------------------------------------------------------------------------*/
-#define IDI_NOTIFY_ICON                (WM_APP + 1)  // Application notification area icon
-
-
-/*-----------------------------------------------------------------------------
- * TRAY MENU COMMANDS
- * Command identifiers for the notification area context menu
- *----------------------------------------------------------------------------*/
-#define IDM_TRAY_SHOW_BALLOON          (WM_APP + 5)  // Show balloon notification
-#define IDM_TRAY_RESTRICT_TO_SYSTEM    (WM_APP + 4)  // Restrict to system-only mode
-#define IDM_TRAY_OPEN_FOLDER           (WM_APP + 3)  // Open output folder
-#define IDM_TRAY_EXIT                  (WM_APP + 2)  // Exit application
-#define IDM_TRAY_SEPARATOR             (WM_APP + 1)  // Menu separator item
-
-
-/*-----------------------------------------------------------------------------
- * CONTROL MESSAGES
- * Custom control notification identifiers
- *----------------------------------------------------------------------------*/
-#define IDC_APP_MULTIPLE_INSTANCES     (WM_APP + 1)  // Multiple instances control
-
-
-// These enumerations represent possible outcomes of clipboard capture operations
-enum class ClipboardResult
+// Enum declarations
+enum class ClipboardResult : unsigned
 {
-	Success,            // Data processed and saved
-	NoData,             // No valid image data in clipboard
-	ConversionFailed,   // CF_BITMAP to CF_DIB conversion failed
-	LockFailed,         // Failed to lock clipboard data
-	UnchangedContent,   // Same content as previous capture
-	SaveFailed,         // File save operation failed
-	InvalidParameter    // Invalid or malformed argument provided
+	Success,
+	NoData,
+	ConversionFailed,
+	LockFailed,
+	UnchangedContent,
+	SaveFailed,
+	InvalidParameter
+};
+
+enum class ThemeResult : unsigned
+{
+	None,
+	DwmAttributeFailed   = 1 << 0,
+	DwmAttributeDisabled = 1 << 1,
+	ThemeFailed          = 1 << 2,
 };
 
 
-// Contains all user-configurable settings that persist between application sessions
-// The settings are loaded from and saved to an INI configuration file
-extern struct AppSettings
+// Application settings structure
+struct AppSettings
 {
-	TCHAR iniPath[MAX_PATH];  // Full path to config file
-	BOOL showNotifications;   // Enable/disable balloon notifications
-	BOOL restrictToSystem;    // Restrict clipboard to svchost.exe
-}g_settings;
+	static constexpr DWORD MAX_CONFIG_PATH_LENGTH = MAX_PATH;
+	static constexpr DWORD MAX_WHITELIST_LENGTH   = MAX_PATH;
+
+	TCHAR configFilePath[MAX_CONFIG_PATH_LENGTH];
+	TCHAR processWhitelist[MAX_WHITELIST_LENGTH];
+	BOOL configFileExists;
+	BOOL notificationsEnabled;
+	BOOL whitelistEnabled;
+	std::unordered_set<UINT32> whitelistHashes;
+};
+
+
+// External declarations
+namespace { extern AppSettings g_appSettings; }
+extern UINT CF_PNG;
+
+
+
+
+// ====================================
+// Flag-style operations on enum types
+// ====================================
+
+// Bitwise OR
+template <typename TEnum>
+constexpr TEnum operator|(TEnum lhs_, TEnum rhs_) noexcept
+{
+	static_assert(std::is_enum_v<TEnum>, "Template parameter must be an enum type");
+	return static_cast<TEnum>(
+		static_cast<std::underlying_type_t<TEnum>>(lhs_) |
+		static_cast<std::underlying_type_t<TEnum>>(rhs_)
+		);
+}
+
+// Compound OR assignment
+template <typename TEnum>
+constexpr TEnum& operator|=(TEnum& lhs_, TEnum rhs_) noexcept
+{
+	static_assert(std::is_enum_v<TEnum>, "Template parameter must be an enum type");
+	lhs_ = static_cast<TEnum>(
+		static_cast<std::underlying_type_t<TEnum>>(lhs_) |
+		static_cast<std::underlying_type_t<TEnum>>(rhs_)
+		);
+	return lhs_;
+}
+
+// Bitwise AND
+template <typename TEnum>
+constexpr TEnum operator&(TEnum lhs_, TEnum rhs_) noexcept
+{
+	static_assert(std::is_enum_v<TEnum>, "Template parameter must be an enum type");
+	return static_cast<TEnum>(
+		static_cast<std::underlying_type_t<TEnum>>(lhs_) &
+		static_cast<std::underlying_type_t<TEnum>>(rhs_)
+		);
+}
+
+// Compound AND assignment
+template <typename TEnum>
+constexpr TEnum& operator&=(TEnum& lhs_, TEnum rhs_) noexcept
+{
+	static_assert(std::is_enum_v<TEnum>, "Template parameter must be an enum type");
+	lhs_ = static_cast<TEnum>(
+		static_cast<std::underlying_type_t<TEnum>>(lhs_) &
+		static_cast<std::underlying_type_t<TEnum>>(rhs_)
+		);
+	return lhs_;
+}
+
+// Flag check helper
+template <typename TEnum>
+constexpr bool HasFlag(TEnum value_, TEnum flag_) noexcept
+{
+	static_assert(std::is_enum_v<TEnum>, "Template parameter must be an enum type");
+	return (static_cast<std::underlying_type_t<TEnum>>(value_) &
+		static_cast<std::underlying_type_t<TEnum>>(flag_)) !=
+		static_cast<std::underlying_type_t<TEnum>>(0);
+}
+
+
+
+// Helper struct to bundle format string and arguments
+template<typename... Args>
+struct Fmt
+{
+	LPCTSTR format;
+	std::tuple<Args...> args;
+
+	Fmt(LPCTSTR fmt, Args&&... a)
+		: format(fmt), args(std::forward<Args>(a)...) {
+	}
+};
+
+// Deduction guide for Fmt
+template<typename... Args> Fmt(LPCTSTR, Args&&...) -> Fmt<Args...>;
+
+
+

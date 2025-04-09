@@ -1,47 +1,76 @@
-//#define _CRT_SECURE_NO_WARNINGS
-#include "ClipboardImageSaver.h"
+
+// Implementation-specific headers
+#include "AppDefine.h"           // Application-wide definitions and constants
+#include "ClipboardImageSaver.h" // Main header
+#include "resource.h"            // Resource identifiers
+#include "murmurhash3.h"         // MurmurHash3 implementation for hashing
+#include "IniSettings.h"         // INI file settings management
+#include "EditDialog.h"          // Edit dialog window
+
+// Windows system headers
+#include <shellapi.h>           // Shell operations (e.g., tray icons)
+#include <versionhelpers.h>     // Windows version checking helpers
+#include <gdiplus.h>            // GDI+ for graphics and image processing
+#include <uxtheme.h>            // Visual styles and theme support
+#include <dwmapi.h>             // Desktop Window Manager APIs (e.g., dark mode)
+
+// Library links
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "Dwmapi.lib")
+
+// Linker directive
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:wmainCRTStartup")
 
 
+// Constants definitions
+UINT CF_PNG = []() {
 #ifndef PNG
-// Register clipboard format for PNG if not predefined
-static UINT CF_PNG = RegisterClipboardFormat(_T("PNG"));
+	return RegisterClipboardFormat(_T("PNG"));
 #else
-// Use the existing predefined PNG format
-static UINT CF_PNG = GetClipboardFormat(PNG); // Assumes `PNG` is a registered format name
+	return GetClipboardFormat(PNG);
 #endif
+	}();
 
 
-// Application-wide constants for naming and identification
-LPCTSTR g_mainName       = _T("Clipboard Image Saver");
-LPCTSTR g_mainClassName  = _T("CISClassname");
-LPCTSTR MUTEX_NAME       = _T("CISInstance");
+// Application state
+namespace
+{
+	HWND g_hMainWnd = NULL;
+	HANDLE g_hMutex = NULL;
+	AppSettings g_appSettings{};
+	LPTSTR g_szLastError{};
 
-// Global handles and structures for window and instance management
-HWND g_hMainWnd{};
-HANDLE g_hMutex{};
-WNDCLASSEXW g_wcex{};
-
-// Defines a structure to hold application settings globally
-AppSettings g_settings;
+	constexpr LPCTSTR MAIN_NAME  = _T("Clipboard Image Saver");
+	constexpr LPCTSTR MAIN_CLASS = _T("CISClassname");
+}
 
 
 // Namespace for INI configuration constants
 namespace IniConfig
 {
 	// Sections
-	constexpr LPCTSTR NOTIFICATIONS  = _T("Notifications");
-	constexpr LPCTSTR GENERAL        = _T("General");
+	constexpr LPCTSTR NOTIFICATIONS = _T("Notifications");
+	constexpr LPCTSTR WHITELIST     = _T("Whitelist");
 
 	// Keys
 	namespace Notifications
 	{
 		constexpr LPCTSTR ENABLED = _T("Enabled");
 	}
-	namespace General
+	namespace Whitelist
 	{
-		constexpr LPCTSTR RESTRICT_TO_SYSTEM = _T("RestrictToSystem");
+		constexpr LPCTSTR ENABLED = _T("Enabled");
+		constexpr LPCTSTR LIST    = _T("List");
 	}
 }
+
+
+// Application-wide constants for naming and identification
+LPCTSTR MUTEX_NAME  = _T("CISInstance");
+LPCTSTR DARKMODE    = _T("DarkMode_Explorer");
+LPCTSTR LIGHTMODE   = _T("Explorer");
+LPCTSTR ERROR_BUFFER_PROP = _T("ErrorFree");
 
 
 
@@ -49,74 +78,99 @@ namespace IniConfig
 // Converts a DWORD error code into a human-readable error message string
 LPCTSTR ErrorToText(DWORD dwErrorCode)
 {
-	static LPTSTR pErrorText;
-	pErrorText = NULL;
+	if (g_szLastError) {
+		LocalFree(g_szLastError);
+		g_szLastError = NULL;
+	}
 
 	// Retrieve the system error message for `dwErrorCode`
 	FormatMessage(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER |           // Allocate buffer automatically
-		FORMAT_MESSAGE_FROM_SYSTEM |               // Use system error message table
-		FORMAT_MESSAGE_IGNORE_INSERTS,             // Ignore any insert sequences in the message
-		NULL,                                      // No specific message source (using system)
-		dwErrorCode,                               // The error code to convert
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), // Default language (neutral, system default)
-		reinterpret_cast<LPTSTR>(&pErrorText),     // Output buffer for the error message
-		0,                                         // Minimum buffer size (ignored due to ALLOCATE_BUFFER)
-		NULL                                       // No additional arguments for message inserts
+		FORMAT_MESSAGE_ALLOCATE_BUFFER |   // Allocate buffer automatically
+		FORMAT_MESSAGE_FROM_SYSTEM |       // Use system error message table
+		FORMAT_MESSAGE_IGNORE_INSERTS,     // Ignore any insert sequences in the message
+		NULL,                              // No specific message source (using system)
+		dwErrorCode,                       // The error code to convert
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),     // Default language (neutral, system default)
+		reinterpret_cast<LPTSTR>(&g_szLastError),  // Output buffer for the error message
+		0,                                 // Minimum buffer size (ignored due to ALLOCATE_BUFFER)
+		NULL                               // No additional arguments for message inserts
 	);
 
-	return pErrorText;
+	return g_szLastError;
 }
 
 // Displays a message box with formatted title and message for error reporting
-template <typename... Args>
-INT ShowMessageBoxNotification(HWND hWnd, UINT uFlags, LPCTSTR titleFormat, LPCTSTR messageFormat, Args&&... args)
+template <typename... TitleArgs, typename... MsgArgs>
+INT ShowMessageBoxNotification(HWND hWnd, UINT uFlags,
+	Fmt<TitleArgs...> titleFmt, Fmt<MsgArgs...> messageFmt)
 {
-	TCHAR title[64]{};    // Buffer for the formatted title (max 64 characters)
-	TCHAR message[256]{}; // Buffer for the formatted message (max 256 characters)
+	TCHAR szTitle[64]{};    // Buffer for the formatted title (max 64 characters)
+	TCHAR szMessage[256]{}; // Buffer for the formatted message (max 256 characters)
 
-	// Format the title string
-	_stprintf_s(
-		title, _countof(title),
-		titleFormat ? titleFormat : _T(""),
-		std::forward<Args>(args)...
-	);
+	// Format title using stored arguments
+	std::apply([&](auto&&... args) {
+		_stprintf_s(
+			szTitle, _countof(szTitle),
+			titleFmt.format ? titleFmt.format : _T(""),
+			args...
+		);
+		}, titleFmt.args);
 
-	// Format the message body
-	_stprintf_s(
-		message, _countof(message),
-		messageFormat ? messageFormat : _T(""),
-		std::forward<Args>(args)...
-	);
+	// Format message using stored arguments
+	std::apply([&](auto&&... args) {
+		_stprintf_s(
+			szMessage, _countof(szMessage),
+			messageFmt.format ? messageFmt.format : _T(""),
+			args...
+		);
+		}, messageFmt.args);
+
+	// Free the local string buffer used for the last error message
+	if (g_szLastError) {
+		LocalFree(g_szLastError);
+		g_szLastError = NULL;
+	}
 
 	// Display the message box and return the user’s response (e.g., IDOK, IDCANCEL)
-	return MessageBox(hWnd, message, title, uFlags);
+	return MessageBox(hWnd, szMessage, szTitle, uFlags);
 }
 
 // Displays a balloon notification with formatted title and message for error reporting
-template <typename... Args>
-BOOL ShowBalloonNotification(NOTIFYICONDATA* pNotifyIconData, DWORD dwInfoFlags, LPCTSTR titleFormat, LPCTSTR messageFormat, Args&&... args)
+template<typename... TitleArgs, typename... MessageArgs>
+BOOL ShowBalloonNotification( NOTIFYICONDATA* pNotifyIconData, DWORD dwInfoFlags,
+	Fmt<TitleArgs...> titleFmt, Fmt<MessageArgs...> messageFmt)
 {
 	if (!pNotifyIconData) { return FALSE; }
+	
+	pNotifyIconData->dwInfoFlags = dwInfoFlags;  // Set notification icon flags (e.g., NIIF_INFO, NIIF_WARNING)
+	pNotifyIconData->uFlags = NIF_INFO;           // Enables balloon tip fields (szInfo, uTimeout, szInfoTitle, dwInfoFlags)
+	pNotifyIconData->uTimeout = 2000;             // 10000 ms max
 
-	// Set notification icon flags (e.g., NIIF_INFO, NIIF_WARNING)
-	pNotifyIconData->dwInfoFlags = dwInfoFlags;
+	// Format title
+	std::apply([&](auto&&... args) {
+		_stprintf_s(
+			pNotifyIconData->szInfoTitle,
+			_countof(pNotifyIconData->szInfoTitle),
+			titleFmt.format ? titleFmt.format : _T(""),
+			args...
+		);
+		}, titleFmt.args);
 
-	// Format and set the notification title
-	_stprintf_s(
-		pNotifyIconData->szInfoTitle,
-		_countof(pNotifyIconData->szInfoTitle), // Use szInfoTitle for consistency
-		titleFormat ? titleFormat : _T(""),
-		std::forward<Args>(args)...
-	);
+	// Format message
+	std::apply([&](auto&&... args) {
+		_stprintf_s(
+			pNotifyIconData->szInfo,
+			_countof(pNotifyIconData->szInfo),
+			messageFmt.format ? messageFmt.format : _T(""),
+			args...
+		);
+		}, messageFmt.args);
 
-	// Format and set the notification message body
-	_stprintf_s(
-		pNotifyIconData->szInfo,
-		_countof(pNotifyIconData->szInfo),
-		messageFormat ? messageFormat : _T(""),
-		std::forward<Args>(args)...
-	);
+	// Free the local string buffer used for the last error message, if it exists
+	if (g_szLastError) {
+		LocalFree(g_szLastError);
+		g_szLastError = NULL;
+	}
 
 	// Update the system tray notification
 	return Shell_NotifyIcon(NIM_MODIFY, pNotifyIconData);
@@ -125,6 +179,9 @@ BOOL ShowBalloonNotification(NOTIFYICONDATA* pNotifyIconData, DWORD dwInfoFlags,
 // Enables dark mode support for the application
 BOOL EnableDarkModeSupport()
 {
+	INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_STANDARD_CLASSES };
+	if (!InitCommonControlsEx(&icex)) { return FALSE; }
+
 	HMODULE hUxtheme = LoadLibraryEx(_T("uxtheme.dll"), NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
 	if (!hUxtheme) { return FALSE; }
 
@@ -163,95 +220,261 @@ BOOL IsSystemDarkThemeEnabled()
 	BOOL isDark = _ShouldAppsUseDarkMode ? _ShouldAppsUseDarkMode() : FALSE;
 
 	FreeLibrary(hUxtheme);
-	return isDark;
+	return isDark & 0xff;
+}
+
+// Window theme enumeration callback
+BOOL CALLBACK ThemeEnumCallback(HWND hWnd, LPARAM lParam)
+{
+	PDWORD pPacked = reinterpret_cast<PDWORD>(lParam);
+	// Unpack high 2 bytes (theme state)
+	const WORD isDarkTheme = HIWORD(*pPacked);
+	// Unpack low 2 bytes (error flag)
+	WORD& rError = *reinterpret_cast<WORD*>(pPacked);
+
+	HRESULT hr = SetWindowTheme(
+		hWnd,
+		isDarkTheme ? DARKMODE : LIGHTMODE,
+		NULL
+	);
+
+	// If successful, recursively enumerate and theme this window's children
+	if (SUCCEEDED(hr)) {
+		EnumChildWindows(
+			hWnd,
+			ThemeEnumCallback,
+			lParam
+		);
+	}
+	else { rError = TRUE; }
+
+	return TRUE;
 }
 
 // Applies the system theme (light or dark) to the specified window
-HRESULT FollowSystemTheme(HWND hWnd)
+ThemeResult FollowSystemTheme(HWND hWnd)
 {
-	BOOL isDark = IsSystemDarkThemeEnabled();
+	ThemeResult error = ThemeResult::None;
 
-	return SetWindowTheme(
+	// Check if the system is currently using a dark theme
+	BOOL isDarkTheme = IsSystemDarkThemeEnabled();
+
+	// Apply DWM attributes (Windows 10+)
+	if (IsWindows10OrGreater()) {
+		HRESULT dwmHr = DwmSetWindowAttribute(
+			hWnd,
+			DWMWA_USE_IMMERSIVE_DARK_MODE, // Affects the non-client area(title bar, borders) and global window attributes
+			&isDarkTheme,
+			sizeof(isDarkTheme)
+		);
+		if (dwmHr == DWM_E_COMPOSITIONDISABLED) { error |= ThemeResult::DwmAttributeDisabled; }
+		else if (FAILED(dwmHr)) { error |= ThemeResult::DwmAttributeFailed; }
+	}
+
+	// Notify the dialog of a theme change by sending a custom message
+	LRESULT lResult = SendMessage(
 		hWnd,
-		isDark ? _T("DarkMode_Explorer") : _T("Explorer"),
-		NULL
+		WM_APP_CUSTOM_MESSAGE,
+		MAKEWPARAM(ID_SYSTEM_THEME, isDarkTheme),
+		(LPARAM)ThemeEnumCallback
 	);
+	if (lResult != ERROR_SUCCESS) { error |= ThemeResult::ThemeFailed; }
+
+	return error;
 }
 
 // Opens the specified folder in Windows Explorer.
-BOOL OpenFolderInExplorer(LPCTSTR folderPath)
+BOOL OpenFolderInExplorer()
 {
-	if (!folderPath) { return FALSE; }
+	TCHAR szDirectoryPath[MAX_PATH]{};
+	if (!GetCurrentDirectory(MAX_PATH, szDirectoryPath)) { return FALSE; }
 
 	// Open the folder in Explorer
-	HINSTANCE result = ShellExecute(
+	HINSTANCE hResult = ShellExecute(
 		NULL,                // No parent window
-		L"open",             // Operation ("open" or "explore")
-		folderPath,          // Path to the folder
+		_T("open"),             // Operation ("open" or "explore")
+		szDirectoryPath,     // Path to the folder
 		NULL,                // No parameters
 		NULL,                // Default directory
 		SW_SHOWNORMAL        // Show window normally
 	);
 
 	// Check for errors (return value <= 32 indicates failure)
-	return ((intptr_t)result > 32);
+	return ((intptr_t)hResult > 32);
 }
 
-// Initialize global settings with defaults or values read from the INI file
-void InitializeDefaultSettings()
+// Converts CR and LF characters to printable placeholders for file storage
+BOOL FormatTextForStorage(LPCTSTR cszSrc, LPTSTR szDest, DWORD cchMax)
 {
-	g_settings.showNotifications =
-		ReadIniInt(
-			IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
-			TRUE, g_settings.iniPath
-		);
-	g_settings.restrictToSystem =
-		ReadIniInt(
-			IniConfig::GENERAL, IniConfig::General::RESTRICT_TO_SYSTEM,
-			TRUE, g_settings.iniPath
-		);
+	if (!cszSrc or !szDest) { return FALSE; }
+
+	LPCTSTR pSrcIt = cszSrc;
+	LPTSTR pDestIt = szDest;
+
+	for (; *pSrcIt and (pDestIt < szDest + cchMax); ++pSrcIt) {
+		if (*pSrcIt == _T('\n')) {
+			*pDestIt++ = _T('|');  // Forbidden for filename
+		}
+		else if (*pSrcIt == _T('\r')) {} // Drop '\r' symbol
+		else {
+			*pDestIt++ = *pSrcIt;
+		}
+	}
+	*pDestIt = _T('\0');
+
+	return (*pSrcIt == _T('\0'));
+}
+
+// Reverses the newline placeholder conversion from file back to original format
+BOOL RestoreTextFromStorage(LPCTSTR cszSrc, LPTSTR szDest, DWORD cchMax)
+{
+	if (!cszSrc or !szDest) { return FALSE; }
+
+	// Handle in-place replacement by processing backward
+	DWORD cchOriginalLen{};
+	DWORD nPipeCount{};
+	LPCTSTR INVALID_CHARS = _T("\\/:*?\"<>");
+
+	// Count '|' characters to determine new length
+	for (LPCTSTR it{ cszSrc }; *it != _T('\0'); ++it, ++cchOriginalLen) {
+		if (*it == _T('|')) { ++nPipeCount; }
+		if (_tcschr(INVALID_CHARS, *it)) { return FALSE; }
+	}
+
+	const DWORD cchNewLen = cchOriginalLen + nPipeCount;
+	if (cchNewLen > cchMax) { return FALSE; }
+
+	// Start from the end of the original and new buffers
+	LPCTSTR pSrcIt = cszSrc + cchOriginalLen - 1;
+	LPTSTR pDestIt = szDest + cchNewLen - 1;
+
+	for (szDest[cchNewLen] = _T('\0'); pSrcIt >= cszSrc; --pSrcIt, --pDestIt) {
+		if (*pSrcIt == _T('|')) {
+			*pDestIt-- = _T('\n'); // Write '\n' first (reverse order)
+			*pDestIt = _T('\r');
+		}
+		else {
+			*pDestIt = *pSrcIt;
+		}
+	}
+
+	return TRUE;
 }
 
 // Fast 32-bit hash function (for binary data)
-UINT32 ComputeDataHash(LPCBYTE pData, SIZE_T dataSize)
+UINT32 ComputeDataHash(LPCBYTE lpcbData, SIZE_T cbDataSize)
 {
-	if (!pData) { return 0; }
+	if (!lpcbData) { return 0; }
 
 	UINT32 seed = 0; // Fixed seed for consistency
-	UINT32 hash = MurmurHash3_32(pData, dataSize, seed);
+	UINT32 hash = MurmurHash3_32(lpcbData, cbDataSize, seed);
 	return hash;
 }
 
-// Check if the file exists and is not a directory
-BOOL IsFileExists(LPCTSTR filePath) {
-	if (!filePath) { return FALSE; }
+// Updates the whitelist hash cache
+void UpdateWhitelistCache()
+{
+	LPCTSTR cszDelim = _T("\r\n");
+	LPTSTR szContext = NULL;
+	LPTSTR szCopy = _tcsdup(g_appSettings.processWhitelist);
 
-	DWORD attributes = GetFileAttributes(filePath);
+	g_appSettings.whitelistHashes.clear();
+	LPTSTR szToken = _tcstok_s(szCopy, cszDelim, &szContext);
+	while (szToken) {
+		g_appSettings.whitelistHashes.insert(ComputeDataHash(
+			reinterpret_cast<const PBYTE>(szToken),
+			_tcslen(szToken) * sizeof(TCHAR)
+		));
+		szToken = _tcstok_s(NULL, cszDelim, &szContext);
+	}
+
+	free(szCopy);
+}
+
+// Updates a specific int setting in a configuration file
+void UpdateSetting(LPCTSTR cszSection, LPCTSTR cszKey, INT nData)
+{
+	if (cszSection == IniConfig::WHITELIST) {
+		if (cszKey == IniConfig::Whitelist::ENABLED) {
+			g_appSettings.whitelistEnabled = (BOOL)nData;
+		}
+	}
+	else if (cszSection == IniConfig::NOTIFICATIONS) {
+		if (cszKey == IniConfig::Notifications::ENABLED) {
+			g_appSettings.notificationsEnabled = (BOOL)nData;
+		}
+	}
+
+	// Prevent automatic file creation in WriteIni* functions
+	if (!g_appSettings.configFileExists) { return; }
+
+	WriteIniInt(cszSection, cszKey, (INT)nData, g_appSettings.configFilePath);
+}
+
+// Updates a specific string setting in a configuration file
+void UpdateSetting(LPCTSTR cszSection, LPCTSTR cszKey, LPTSTR szText, DWORD cchTextMax)
+{
+	if (!szText) { return; }
+
+	if (cszSection == IniConfig::WHITELIST) {
+		if (cszKey == IniConfig::Whitelist::LIST) {
+			_tcscpy_s(g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH, szText);
+			UpdateWhitelistCache();
+			FormatTextForStorage(g_appSettings.processWhitelist, szText, cchTextMax);
+		}
+	}
+
+	// Prevent automatic file creation in WriteIni* functions
+	if (!g_appSettings.configFileExists) { return; }
+
+	WriteIniString(cszSection, cszKey, szText, g_appSettings.configFilePath);
+}
+
+// Check if the file exists and is not a directory
+BOOL IsFileExists(LPCTSTR cszFilePath) {
+	if (!cszFilePath) { return FALSE; }
+
+	DWORD attributes = GetFileAttributes(cszFilePath);
 	return (attributes != INVALID_FILE_ATTRIBUTES and
 		!(attributes & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// Function to compute hash of an LPCTSTR and check existence in the whitelist
+BOOL IsStringWhitelisted(LPCTSTR cszText)
+{
+	if (!cszText) { return FALSE; }
+
+	SIZE_T cbSize = _tcslen(cszText) * sizeof(TCHAR); // Calculate byte size
+	UINT32 uHash = ComputeDataHash(reinterpret_cast<LPCBYTE>(cszText), cbSize);
+	auto& usCache = g_appSettings.whitelistHashes;
+
+	return usCache.find(uHash) != usCache.end();  // Check if hash exists in whitelist
 }
 
 // Generates a filename string
 LPCTSTR GenerateFilename()
 {
-	static TCHAR buffer[MAX_PATH]{};
-	static DWORD baseLength{}; // Directory + prefix length
-	static LPCTSTR prefix = _T("\\screenshot_");
-	static LPCTSTR extension = _T(".png");
-	static const BYTE prefixLength = 12; // Length of prefix without null terminator
-	static const BYTE timestampLength = 18; // Exact length of "%04d%02d%02d_%02d%02d%02d%03d"
-	static const BYTE extensionLength = 4; // Length of ".png"
+	static TCHAR szBuffer[MAX_PATH]{};
+	static DWORD dwBaseLength{};              // Directory + prefix length
+	static LPCTSTR cszPrefix = _T("\\screenshot_");
+	static LPCTSTR cszExtension = _T(".png");
+	static const BYTE byPrefixLength = 12;    // Length of prefix without null terminator
+	static const BYTE byTimestampLength = 18; // Exact length of "%04d%02d%02d_%02d%02d%02d%03d"
+	static const BYTE byExtensionLength = 4;  // Length of ".png"
 
-	if (!baseLength) {
-		DWORD dirLength = GetCurrentDirectory(MAX_PATH, buffer);
-		if (dirLength == 0 || dirLength + prefixLength + timestampLength + extensionLength >= MAX_PATH) {
-			// Handle error: directory too long or other failure
-			buffer[0] = _T('\0');
+	if (!dwBaseLength) {
+		DWORD dwDirectoryLength = GetCurrentDirectory(MAX_PATH, szBuffer);
+		if (dwDirectoryLength == 0 or
+			dwDirectoryLength + byPrefixLength + byTimestampLength + byExtensionLength >= MAX_PATH)
+		{
+			szBuffer[0] = _T('\0');
 			return NULL;
 		}
+
 		// Add prefix
-		_tcscpy_s(buffer + dirLength, MAX_PATH - dirLength, prefix);
-		baseLength = dirLength + prefixLength;
+		_tcscpy_s(szBuffer + dwDirectoryLength, MAX_PATH - dwDirectoryLength, cszPrefix);
+		// Add prefix length
+		dwBaseLength = dwDirectoryLength + byPrefixLength;
 	}
 
 	// Generate timestamp
@@ -260,8 +483,8 @@ LPCTSTR GenerateFilename()
 
 	// Format directly into buffer at baseLength (YYYYMMDD_HHMMSSmmm)
 	_stprintf_s(
-		buffer + baseLength,       // Target position
-		timestampLength + 1,       // Max allowed chars: 18 + null terminator
+		szBuffer + dwBaseLength,   // Target position
+		byTimestampLength + 1,     // Max allowed chars: 18 + null terminator
 		_T("%04d%02d%02d_%02d%02d%02d%03d"),  // Format: YYYYMMDD_HHMMSSmmm
 		st.wYear,                  // 4-digit year
 		st.wMonth,                 // 2-digit month
@@ -273,35 +496,76 @@ LPCTSTR GenerateFilename()
 	);
 
 	// Add extension
-	_tcscpy_s(buffer + baseLength + timestampLength, MAX_PATH - baseLength - timestampLength, extension);
+	_tcscpy_s(
+		szBuffer + dwBaseLength + byTimestampLength,
+		MAX_PATH - dwBaseLength - byTimestampLength,
+		cszExtension
+	);
 
-	return buffer;
+	return szBuffer;
+}
+
+// Initialize global settings with defaults or values read from the INI file
+BOOL InitializeDefaultSettings()
+{
+	if (!GetIniFilePath(g_appSettings.configFilePath,
+		g_appSettings.MAX_CONFIG_PATH_LENGTH))
+	{ return FALSE; }
+
+	g_appSettings.configFileExists = 
+		IsFileExists(
+			g_appSettings.configFilePath
+		);
+	g_appSettings.notificationsEnabled =
+		ReadIniInt(
+			IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
+			TRUE, g_appSettings.configFilePath
+		);
+	g_appSettings.whitelistEnabled =
+		ReadIniInt(
+			IniConfig::WHITELIST, IniConfig::Whitelist::ENABLED,
+			TRUE, g_appSettings.configFilePath
+		);
+
+	const DWORD cchBuffer = g_appSettings.MAX_WHITELIST_LENGTH;
+	TCHAR szBuffer[cchBuffer];
+	ReadIniString(
+		IniConfig::WHITELIST, IniConfig::Whitelist::LIST,
+		_T("svchost.exe"),
+		szBuffer, cchBuffer,
+		g_appSettings.configFilePath
+	);
+	RestoreTextFromStorage(szBuffer,
+		g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH);
+	UpdateWhitelistCache();
+
+	return TRUE;
 }
 
 // Helper function to get the PNG encoder CLSID
-INT GetEncoderClsid(LPCTSTR format, CLSID* pClsid)
+INT GetEncoderClsid(LPCTSTR cszFormat, CLSID* pClsid)
 {
-	if (!format or !pClsid) { return -1; }
+	if (!cszFormat or !pClsid) { return -1; }
 
-	UINT num{};
-	UINT pathSize{};
+	UINT numEncoders{};
+	UINT dwPathSize{};
 
-	Gdiplus::GetImageEncodersSize(&num, &pathSize);
-	if (num == 0 or pathSize == 0) {
+	Gdiplus::GetImageEncodersSize(&numEncoders, &dwPathSize);
+	if (numEncoders == 0 or dwPathSize == 0) {
 		return -1;
 	}
 
-	Gdiplus::ImageCodecInfo* pImageCodecInfo = static_cast<Gdiplus::ImageCodecInfo*>(malloc(pathSize));
+	Gdiplus::ImageCodecInfo* pImageCodecInfo = static_cast<Gdiplus::ImageCodecInfo*>(malloc(dwPathSize));
 	if (!pImageCodecInfo) {
 		return -1;
 	}
 
-	Gdiplus::GetImageEncoders(num, pathSize, pImageCodecInfo);
+	Gdiplus::GetImageEncoders(numEncoders, dwPathSize, pImageCodecInfo);
 
 #pragma warning(push)
 #pragma warning(disable: 6385)
-	for (UINT j = 0; j < num; ++j) {
-		if (_tcscmp(pImageCodecInfo[j].MimeType, format) == 0) {
+	for (UINT j{}; j < numEncoders; ++j) {
+		if (_tcscmp(pImageCodecInfo[j].MimeType, cszFormat) == 0) {
 			*pClsid = pImageCodecInfo[j].Clsid;
 			free(pImageCodecInfo);
 			return j;
@@ -314,46 +578,46 @@ INT GetEncoderClsid(LPCTSTR format, CLSID* pClsid)
 }
 
 // Function to save PNG to file
-BOOL SavePNGToFile(HGLOBAL hData, LPCTSTR filename)
+BOOL SavePNGToFile(HGLOBAL hData, LPCTSTR cszFilename)
 {
-	if (!hData or !filename) { return FALSE; }
+	if (!hData or !cszFilename) { return FALSE; }
 
 	// Handle PNG data directly
 	LPVOID pngData = GlobalLock(hData);
-	BOOL success{};
+	BOOL bSuccess{};
 
 	if (pngData) {
-		SIZE_T dataSize = GlobalSize(hData);
-		HANDLE hFile = CreateFile(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		SIZE_T cbDataSize = GlobalSize(hData);
+		HANDLE hFile = CreateFile(cszFilename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (hFile != INVALID_HANDLE_VALUE) {
 			DWORD bytesWritten;
-			WriteFile(hFile, pngData, (DWORD)dataSize, &bytesWritten, NULL);
+			WriteFile(hFile, pngData, (DWORD)cbDataSize, &bytesWritten, NULL);
 			CloseHandle(hFile);
-			success = (bytesWritten == dataSize);
+			bSuccess = (bytesWritten == cbDataSize);
 		}
 		GlobalUnlock(hData);
 	}
-	return success;
+	return bSuccess;
 }
 
 // Function to save DIB to PNG file
-BOOL SaveDIBToFile(HGLOBAL hData, LPCTSTR filename)
+BOOL SaveDIBToFile(HGLOBAL hData, LPCTSTR cszFilename)
 {
-	if (!hData or !filename) { return FALSE; }
+	if (!hData or !cszFilename) { return FALSE; }
 
 	// Lock the DIB to access its data
-	BITMAPINFO* bmi = (BITMAPINFO*)GlobalLock(hData);
-	if (!bmi) { return FALSE; }
+	BITMAPINFO* pbmi = (BITMAPINFO*)GlobalLock(hData);
+	if (!pbmi) { return FALSE; }
 
 	// Calculate the offset to the pixel data
-	DWORD colorTableSize{};
-	if (bmi->bmiHeader.biBitCount <= 8) {
-		colorTableSize = (bmi->bmiHeader.biClrUsed ? bmi->bmiHeader.biClrUsed : (1 << bmi->bmiHeader.biBitCount)) * sizeof(RGBQUAD);
+	DWORD dwColorTableSize{};
+	if (pbmi->bmiHeader.biBitCount <= 8) {
+		dwColorTableSize = (pbmi->bmiHeader.biClrUsed ? pbmi->bmiHeader.biClrUsed : (1 << pbmi->bmiHeader.biBitCount)) * sizeof(RGBQUAD);
 	}
-	LPVOID pixels = (BYTE*)bmi + bmi->bmiHeader.biSize + colorTableSize;
+	LPVOID pPixels = (BYTE*)pbmi + pbmi->bmiHeader.biSize + dwColorTableSize;
 
 	// Create a GDI+ Bitmap from the DIB
-	Gdiplus::Bitmap bitmap(bmi, pixels);
+	Gdiplus::Bitmap bitmap(pbmi, pPixels);
 
 	// Get the PNG encoder CLSID
 	CLSID pngClsid;
@@ -363,47 +627,39 @@ BOOL SaveDIBToFile(HGLOBAL hData, LPCTSTR filename)
 	}
 
 	// Save the bitmap as PNG
-	Gdiplus::Status status = bitmap.Save(filename, &pngClsid, NULL);
+	Gdiplus::Status gdiStatus = bitmap.Save(cszFilename, &pngClsid, NULL);
 
 	// Clean up
 	GlobalUnlock(hData);
-	return status == Gdiplus::Ok;
-}
-
-// Determines if the specified executable name is allowed based on a predefined list
-BOOL CheckOwnerAllowed(LPCTSTR exeName)
-{
-	if (!exeName) { return FALSE; }
-
-	return (_tcsicmp(exeName, _T("svchost.exe")) == 0);
+	return gdiStatus == Gdiplus::Ok;
 }
 
 // Retrieves the executable path of the clipboard owner process
 LPCTSTR RetrieveClipboardOwner()
 {
-	static TCHAR exePath[MAX_PATH]; // Buffer for the executable path
+	static TCHAR szExePath[MAX_PATH]; // Buffer for the executable path
 
 	HWND hClipboardOwner = GetClipboardOwner();
 	if (!hClipboardOwner) { return NULL; }
 
-	DWORD processId{};
-	GetWindowThreadProcessId(hClipboardOwner, &processId);
-	if (!processId) { return NULL; }
+	DWORD dwProcessId{};
+	GetWindowThreadProcessId(hClipboardOwner, &dwProcessId);
+	if (!dwProcessId) { return NULL; }
 
-	HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwProcessId);
 	if (!hProcess) { return NULL; }
 
-	DWORD pathSize = MAX_PATH;
-	BOOL success = QueryFullProcessImageName(hProcess, 0, exePath, &pathSize);
+	DWORD dwPathSize = MAX_PATH;
+	BOOL bSuccess = QueryFullProcessImageName(hProcess, 0, szExePath, &dwPathSize);
 	CloseHandle(hProcess);
-	if (!success) { return NULL; }
+	if (!bSuccess) { return NULL; }
 
 	// Extract the executable name
-	LPCTSTR exeName = _tcsrchr(exePath, _T('\\'));
-	if (!exeName) { return NULL; }
-	++exeName; // Move past the backslash
+	LPCTSTR cszExeName = _tcsrchr(szExePath, _T('\\'));
+	if (!cszExeName) { return NULL; }
+	++cszExeName; // Move past the backslash
 
-	return exeName;
+	return cszExeName;
 }
 
 // Convert bitmap to DIB
@@ -431,23 +687,23 @@ HGLOBAL GetClipboardImageData(INT* pFormat)
 {
 	if (!pFormat) { return 0; }
 
-	static UINT formatPriorityList[]{ CF_PNG, CF_DIBV5, CF_DIB, CF_BITMAP };
+	static UINT uFormatPriorityList[]{ CF_PNG, CF_DIBV5, CF_DIB, CF_BITMAP };
 
 	HGLOBAL hClipboardData{};
 	HGLOBAL hCopy{};
 	*pFormat = 0;
 
-	INT nFormat = GetPriorityClipboardFormat(formatPriorityList, _countof(formatPriorityList));
+	INT nFormat = GetPriorityClipboardFormat(uFormatPriorityList, _countof(uFormatPriorityList));
 	if (nFormat) {
 		hClipboardData = GetClipboardData(nFormat);
 		if (hClipboardData) {
-			SIZE_T dataSize = GlobalSize(hClipboardData);
-			hCopy = GlobalAlloc(GMEM_MOVEABLE, dataSize);
+			SIZE_T cbDataSize = GlobalSize(hClipboardData);
+			hCopy = GlobalAlloc(GMEM_MOVEABLE, cbDataSize);
 			if (hCopy) {
 				LPVOID pSrc = GlobalLock(hClipboardData);
 				LPVOID pDest = GlobalLock(hCopy);
 				if (pSrc && pDest) {
-					memcpy(pDest, pSrc, dataSize);
+					memcpy(pDest, pSrc, cbDataSize);
 					*pFormat = nFormat;
 				}
 				GlobalUnlock(hClipboardData);
@@ -459,17 +715,17 @@ HGLOBAL GetClipboardImageData(INT* pFormat)
 }
 
 // Processes clipboard data and handles related operations
-ClipboardResult HandleClipboardData(LPTSTR sFormat, UINT cChFormat)
+ClipboardResult HandleClipboardData(LPTSTR szFormat, UINT cchFormat)
 {
-	static DWORD lastDataHash{};
-	static SIZE_T lastDataSize{};
+	static DWORD dwLastDataHash{};
+	static SIZE_T cbLastDataSize{};
 
-	if (!sFormat) { return ClipboardResult::InvalidParameter; }
+	if (!szFormat) { return ClipboardResult::InvalidParameter; }
 
 	INT nFormat{};
 	HGLOBAL hClipboardData = GetClipboardImageData(&nFormat);
 
-	_tcscpy_s(sFormat, cChFormat, [&]() {
+	_tcscpy_s(szFormat, cchFormat, [&]() {
 		if (nFormat == CF_PNG)    return _T("PNG");
 		if (nFormat == CF_DIBV5)  return _T("DIBV5");
 		if (nFormat == CF_DIB)    return _T("DIB");
@@ -491,129 +747,158 @@ ClipboardResult HandleClipboardData(LPTSTR sFormat, UINT cChFormat)
 		nFormat = CF_DIB;
 	}
 
-	LPBYTE pData = static_cast<LPBYTE>(GlobalLock(hClipboardData));
-	if (!pData) {
+	LPBYTE lpcbData = static_cast<LPBYTE>(GlobalLock(hClipboardData));
+	if (!lpcbData) {
 		GlobalFree(hClipboardData);
 		return ClipboardResult::LockFailed;
 	}
 
 	// Calculate content hash
-	const SIZE_T dataSize = GlobalSize(hClipboardData);
-	const DWORD dataHash = ComputeDataHash(pData, dataSize);
+	const SIZE_T cbDataSize = GlobalSize(hClipboardData);
+	const DWORD dwDataHash = ComputeDataHash(lpcbData, cbDataSize);
 	GlobalUnlock(hClipboardData);
 
 	// Check for duplicate content
-	if (dataSize == lastDataSize && dataHash == lastDataHash) {
+	if (cbDataSize == cbLastDataSize && dwDataHash == dwLastDataHash) {
 		GlobalFree(hClipboardData);
 		return ClipboardResult::UnchangedContent;
 	}
 
 	// Generate filename and save
-	LPCTSTR sFilename = GenerateFilename();
-	if (!sFilename) {
+	LPCTSTR cszFilename = GenerateFilename();
+	if (!cszFilename) {
 		GlobalFree(hClipboardData);
 		return ClipboardResult::SaveFailed;
 	}
 
-	BOOL result{};
+	BOOL bResult{};
 	if (nFormat == CF_PNG) {
-		result = SavePNGToFile(hClipboardData, sFilename);
+		bResult = SavePNGToFile(hClipboardData, cszFilename);
 	}
 	else {
-		result = SaveDIBToFile(hClipboardData, sFilename);
+		bResult = SaveDIBToFile(hClipboardData, cszFilename);
 	}
 
 	GlobalFree(hClipboardData);
 
-	if (!result) {
+	if (!bResult) {
 		return ClipboardResult::SaveFailed;
 	}
 
 	// Update state only after successful save
-	lastDataHash = dataHash;
-	lastDataSize = dataSize;
+	dwLastDataHash = dwDataHash;
+	cbLastDataSize = cbDataSize;
 
 	return ClipboardResult::Success;
 }
 
 // Tray Icon initialization
-BOOL InitializeNotificationIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* hIcon)
+BOOL InitializeNotifyIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* pIcon)
 {
-	if (!pNotifyIconData or !hWnd or !hIcon) { return FALSE; }
+	if (!pNotifyIconData or !hWnd or !pIcon) { return FALSE; }
 
 	// Load the icon
-	*hIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_MAIN_ICON));
-	if (!*hIcon) { return FALSE; }
+	*pIcon = LoadIcon(GetModuleHandle(NULL), MAKEINTRESOURCE(IDI_MAIN_ICON));
+	if (!*pIcon) { return FALSE; }
 
 	// Initialize NOTIFYICONDATA with modern settings
-	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA); // Use full structure size
-	pNotifyIconData->hWnd = hWnd;
-	pNotifyIconData->uID = IDI_NOTIFY_ICON;
-	pNotifyIconData->uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | NIF_INFO; // Modern flags
-	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;
-	pNotifyIconData->hIcon = *hIcon;
-	pNotifyIconData->dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;  // For custom icons
-	_tcscpy_s(pNotifyIconData->szTip, g_mainName);
+	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA);  // Specifies the size of the structure, required by Shell_NotifyIcon
+	pNotifyIconData->hWnd = hWnd;                      // Associates the tray icon with a window to receive callback messages
+	pNotifyIconData->uID = IDI_NOTIFY_ICON;            // A unique identifier for the tray icon
+	pNotifyIconData->uFlags =
+		NIF_ICON |		// The tray icon
+		NIF_MESSAGE |   // Event handling
+		NIF_TIP |       // Tooltip text
+		NIF_SHOWTIP;    // Ensures the tooltip appears when hovering (Windows 10/11 enhancement)
+	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;   // Defines the custom message
+	pNotifyIconData->hIcon = *pIcon;                       // Specifies the icon to display in the tray (paired with NIF_ICON)
+	_tcscpy_s(pNotifyIconData->szTip, MAIN_NAME);          // Sets the tooltip text (paired with NIF_TIP)
 	// Required for Windows 10/11
-	pNotifyIconData->dwState = NIS_SHAREDICON;
-	pNotifyIconData->dwStateMask = NIS_SHAREDICON;
+	pNotifyIconData->dwState = NIS_SHAREDICON;             // Indicates the icon is shared and shouldn’t be deleted when the notification is removed
+	pNotifyIconData->dwStateMask = NIS_SHAREDICON;         // Specifies which state bits to modify
 	// First add the icon to the tray
-	if (!Shell_NotifyIcon(NIM_ADD, pNotifyIconData)) {
-		return FALSE;
-	}
+	if (!Shell_NotifyIcon(NIM_ADD, pNotifyIconData)) { return FALSE; }  // Adds the tray icon to the system tray
 	// Set version AFTER adding
-	pNotifyIconData->uVersion = NOTIFYICON_VERSION_4; // Use modern features
-	//g_notifyIconData.uTimeout = 1000;  // 10 seconds (max allowed)
+	pNotifyIconData->uVersion = NOTIFYICON_VERSION_4;      // Sets the tray icon version to enable modern features (e.g., balloon tips, improved behavior on Windows 10/11)
+
 	return Shell_NotifyIcon(NIM_SETVERSION, pNotifyIconData);
 }
 
 // Initializes the GDI+ library for image processing
-BOOL InitializeGDIPlus(ULONG_PTR* gdiplusToken)
+BOOL InitializeGDIPlus(ULONG_PTR* pGdiPlusToken)
 {
-	if (!gdiplusToken) { return FALSE; }
+	if (!pGdiPlusToken) { return FALSE; }
 
 	Gdiplus::GdiplusStartupInput startupInput;
-	return Gdiplus::GdiplusStartup(gdiplusToken, &startupInput, NULL) == Gdiplus::Status::Ok;
+	return Gdiplus::GdiplusStartup(pGdiPlusToken, &startupInput, NULL) == Gdiplus::Status::Ok;
 }
 
 // Creates a popup menu for the system tray
-BOOL CreateTrayPopupMenu(HMENU* hTrayContextMenu)
+BOOL CreateTrayContextMenu(HMENU* pMenu)
 {
-	if (!hTrayContextMenu) { return FALSE; }
+	if (!pMenu) { return FALSE; }
 
-	*hTrayContextMenu = CreatePopupMenu();
-	if (!*hTrayContextMenu) { return FALSE; }
+	*pMenu = CreatePopupMenu();
+	if (!*pMenu) { return FALSE; }
 
-	AppendMenu(*hTrayContextMenu, MF_STRING, IDM_TRAY_OPEN_FOLDER,
+	AppendMenu(*pMenu, MF_STRING, IDM_TRAY_OPEN_FOLDER,
 		_T("Open folder")
 	);
-	AppendMenu(*hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
-	AppendMenu(*hTrayContextMenu,
-		MF_STRING | (g_settings.restrictToSystem ? MF_CHECKED : MF_UNCHECKED),
-		IDM_TRAY_RESTRICT_TO_SYSTEM, _T("Restrict to System")
+	AppendMenu(*pMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
+	AppendMenu(*pMenu,
+		MF_STRING | (g_appSettings.whitelistEnabled ? MF_CHECKED : MF_UNCHECKED),
+		IDM_TRAY_TOGGLE_WHITELIST, _T("Use whitelist")
 	);
-	AppendMenu(*hTrayContextMenu,
-		MF_STRING | (g_settings.showNotifications ? MF_CHECKED : MF_UNCHECKED),
-		IDM_TRAY_SHOW_BALLOON, _T("Show notifications")
+	AppendMenu(*pMenu,
+		MF_STRING | (g_appSettings.whitelistEnabled ? 0 : MF_GRAYED),
+		IDM_TRAY_EDIT_WHITELIST, _T("Edit Whitelist")
 	);
-	AppendMenu(*hTrayContextMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
-	AppendMenu(*hTrayContextMenu, MF_STRING, IDM_TRAY_EXIT,
+	AppendMenu(*pMenu,
+		MF_STRING | (g_appSettings.notificationsEnabled ? MF_CHECKED : MF_UNCHECKED),
+		IDM_TRAY_TOGGLE_NOTIFICATIONS, _T("Show notifications")
+	);
+	AppendMenu(*pMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
+	AppendMenu(*pMenu, MF_STRING, IDM_TRAY_EXIT,
 		_T("Exit")
 	);
 
-	return *hTrayContextMenu != NULL;
+	return *pMenu != NULL;
+}
+
+// Shows a popup menu for the system tray
+BOOL ShowTrayContextMenu(HWND hWnd)
+{
+	HMENU hMenu;
+
+	if (CreateTrayContextMenu(&hMenu)) {
+		SetForegroundWindow(hWnd); // Required for focus
+
+		POINT pt;
+		GetCursorPos(&pt);
+
+		TrackPopupMenu(
+			hMenu,
+			TPM_LEFTALIGN | TPM_LEFTBUTTON | TPM_NONOTIFY,
+			pt.x, pt.y,
+			0, hWnd, NULL
+		);
+
+		DestroyMenu(hMenu);
+		return TRUE;
+	}
+	return FALSE;
 }
 
 // Checks if the required time has elapsed since the last trigger time
-BOOL IsTimeElapsed(ULONGLONG requiredElapsedTime)
+BOOL IsTimeElapsed(ULONGLONG ulRequiredElapsedTime)
 {
-	static ULONGLONG previousTriggerTime{};
-	ULONGLONG currentSystemTime = GetTickCount64();
+	static ULONGLONG ulPreviousTriggerTime{};
+	ULONGLONG ulCurrentSystemTime = GetTickCount64();
 
-	if (currentSystemTime < requiredElapsedTime + previousTriggerTime) {
+	if (ulCurrentSystemTime < ulRequiredElapsedTime + ulPreviousTriggerTime) {
 		return FALSE;
 	}
-	previousTriggerTime = currentSystemTime;
+	ulPreviousTriggerTime = ulCurrentSystemTime;
 
 	return TRUE;
 }
@@ -621,23 +906,35 @@ BOOL IsTimeElapsed(ULONGLONG requiredElapsedTime)
 // Attempts to open the clipboard with retry logic on access denial
 BOOL TryOpenClipboard()
 {
-	BOOL result = OpenClipboard(NULL);
-	if (result) {
-		return TRUE;
-	}
+	BOOL bResult = OpenClipboard(NULL);
+	if (bResult) { return TRUE; }
 
 	DWORD dwError = GetLastError();
 	if (dwError == ERROR_ACCESS_DENIED) { // Clipboard is being held by another process
-		INT retries = 4;
-		UINT delay = 50;  // ms
+		INT nRetries = 4;
+		UINT uDelay = 50;  // ms
 
 		// Retry logic with progressive backoff
 		do {
-			Sleep(delay);
-			delay *= 2;  // Exponential backoff
-		} while (retries-- > 0 and !(result = OpenClipboard(NULL)));
+			Sleep(uDelay);
+			uDelay *= 2;  // Exponential backoff
+		} while (nRetries-- > 0 and !(bResult = OpenClipboard(NULL)));
 	}
-	return result;
+	return bResult;
+}
+
+// Validates a string for Windows application names by checking for invalid characters
+BOOL CheckTextCorrectness(LPCTSTR lpcszText)
+{
+	if (!lpcszText) { return FALSE; }
+
+	// These are typically invalid filename characters in Windows
+	for (LPCTSTR INVALID_CHARS{ _T("\\/:*?\"<>|") }; *lpcszText; ++lpcszText) {
+		if (_tcschr(INVALID_CHARS, *lpcszText)) {
+			return FALSE;
+		}
+	}
+	return TRUE;
 }
 
 
@@ -645,12 +942,11 @@ BOOL TryOpenClipboard()
 LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	// Variable to track exit code
-	static INT exitCode{}; // Default: success
+	static INT nExitCode{}; // Default: success
 
 	static HICON hIcon{};
-	static ULONG_PTR gdiplusToken{};
+	static ULONG_PTR pGdiPlusToken{};
 	static NOTIFYICONDATA notifyIconData{};
-	static HMENU hTrayContextMenu{};
 
 
 	switch (uMsg)
@@ -658,92 +954,259 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_CLIPBOARDUPDATE:
 	{
-		static const UINT maxFormatStringLength = 64;
-		static TCHAR clipboardFormatBuffer[maxFormatStringLength];
+		static const UINT uMaxFormatStringLength = 64;
+		static TCHAR szClipboardFormatBuffer[uMaxFormatStringLength];
 
 		// Debounce
-		const ULONGLONG minTimeBetweenUpdates = 50; // 50ms
-		if (!IsTimeElapsed(minTimeBetweenUpdates)) {
+		const ULONGLONG ulMinTimeBetweenUpdates = 50; // 50ms
+		if (!IsTimeElapsed(ulMinTimeBetweenUpdates)) {
 			break;
 		}
 
 		if (!TryOpenClipboard()) {
 			ShowBalloonNotification(
 				&notifyIconData, NIIF_ERROR,
-				_T("Clipboard Error"), _T("Failed to access clipboard.\n%s"),
-				ErrorToText(GetLastError())
+				Fmt(_T("Clipboard Error")),
+				Fmt(_T("Failed to access clipboard." EOL_ "%s"),
+					ErrorToText(GetLastError()))
 			);
 			break;
 		}
 
 		// Retrieves the name of the clipboard data owner
-		LPCTSTR clipboardOwner = RetrieveClipboardOwner();
-		if (!clipboardOwner) {
+		LPCTSTR cszClipboardOwner = RetrieveClipboardOwner();
+		if (!cszClipboardOwner) {
 			CloseClipboard();
 			break;
 		}
 
 		// Checks if the 'Restrict to System' option is enabled
-		if (g_settings.restrictToSystem == TRUE) {
-			if (!CheckOwnerAllowed(clipboardOwner)) {
+		if (g_appSettings.whitelistEnabled == TRUE) {
+			if (!IsStringWhitelisted(cszClipboardOwner)) {
 				CloseClipboard();
 				break;
 			}
 		}
 
-		const BOOL isNotificationsAllowed = (GetMenuState(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON, MF_BYCOMMAND) & MF_CHECKED) == MF_CHECKED;
-
 		// Helper function for error cases
-		const auto HandleClipboardError = [&](LPCTSTR title, LPCTSTR message) {
-			if (isNotificationsAllowed) {
+		const auto HandleClipboardError = [&](LPCTSTR szTitle, LPCTSTR szMessage) {
+			if (g_appSettings.notificationsEnabled) {
 				ShowBalloonNotification(
 					&notifyIconData, NIIF_ERROR,
-					title, _T("%s.\n%s"),
-					message, ErrorToText(GetLastError())
+					Fmt(szTitle),
+					Fmt(_T("%s." EOL_ "%s"),
+						szMessage, ErrorToText(GetLastError()))
 				);
 			}
 			CloseClipboard();
-			exitCode = -1;
+			nExitCode = -1;
 			DestroyWindow(hWnd);
 			};
 
 		// Helper function for success notifications
-		const auto ShowStatusNotification = [&](LPCTSTR title) {
-			if (isNotificationsAllowed) {
+		const auto ShowStatusNotification = [&](LPCTSTR szTitle) {
+			if (g_appSettings.notificationsEnabled) {
 				ShowBalloonNotification(
-					&notifyIconData, NIIF_INFO,
-					title, _T("Owner:  %s\nType:  %s"),
-					clipboardOwner, clipboardFormatBuffer
+					&notifyIconData, NIIF_INFO | NIIF_USER | NIIF_LARGE_ICON,
+					Fmt(szTitle),
+					Fmt(_T("Owner:  %s" EOL_ "Type:  %s"),
+						cszClipboardOwner, szClipboardFormatBuffer)
 				);
 			}
 			};
 
-		switch (HandleClipboardData(clipboardFormatBuffer, maxFormatStringLength))
-		{
+		ClipboardResult clipboardResult = 
+			HandleClipboardData(szClipboardFormatBuffer, uMaxFormatStringLength);
+
+		switch (clipboardResult) {
 		case ClipboardResult::Success:
 			ShowStatusNotification(_T("Clipboard Data Captured"));
 			break;
-
 		case ClipboardResult::UnchangedContent:
 			//ShowStatusNotification(_T("Clipboard Data Ignored"));
 			break;
-
 		case ClipboardResult::ConversionFailed:
 			HandleClipboardError(_T("Image Conversion Error"), _T("Failed to convert bitmap to DIB format"));
 			return -1;
-
 		case ClipboardResult::LockFailed:
 			HandleClipboardError(_T("Memory Error"), _T("Failed to lock clipboard memory"));
 			return -1;
-
 		case ClipboardResult::SaveFailed:
 			HandleClipboardError(_T("Save Error"), _T("Failed to save image to file"));
 			return -1;
-
-		default: break;
-		}
+		default: break; }
 
 		CloseClipboard();
+		break;
+	}
+
+	case WM_COMMAND:
+	{
+		WORD wCommandId = LOWORD(wParam);
+		WORD wNotificationCode = HIWORD(wParam);
+
+		if (wNotificationCode == 0) {  // Menu/accelerator
+			if (wCommandId == IDM_TRAY_EXIT) {
+				SendMessage(hWnd, WM_CLOSE, 0, 0);
+				break;
+			}
+
+			if (wCommandId == IDM_TRAY_OPEN_FOLDER) {
+				if (!OpenFolderInExplorer()) {
+					ShowBalloonNotification(
+						&notifyIconData, NIIF_WARNING,
+						Fmt(_T("Explorer Error")),
+						Fmt(_T("Failed to open folder in File Explorer." EOL_ "%s"),
+							ErrorToText(GetLastError()))
+					);
+				}
+				break;
+			}
+
+			if (wCommandId == IDM_TRAY_TOGGLE_WHITELIST) {
+				UpdateSetting(IniConfig::WHITELIST, IniConfig::Whitelist::ENABLED,
+					(INT)!g_appSettings.whitelistEnabled);
+				break;
+			}
+
+			if (wCommandId == IDM_TRAY_EDIT_WHITELIST) {
+				// Initialize dialog parameters with initial dialog text and its buffer max size
+				DialogParams params{  // Copy will be accessible via GWLP_USERDATA
+					g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH
+				};
+
+				// Create and show the custom dialog, passing the parameters
+				HWND hDialog = ShowCustomDialog(hWnd, &params);
+				if (!hDialog) {
+					ShowBalloonNotification(
+						&notifyIconData, NIIF_WARNING,
+						Fmt(_T("Dialog Error")),
+						Fmt(_T("Failed to create dialog window." EOL_ "%s"),
+							ErrorToText(GetLastError()))
+					);
+					break;
+				}
+
+				// Apply theme to dialog window
+				ThemeResult themeResult = FollowSystemTheme(hDialog);
+				if (HasFlag(themeResult, ThemeResult::ThemeFailed)) {
+					ShowBalloonNotification(
+						&notifyIconData, NIIF_WARNING,
+						Fmt(_T("Theme Error")),
+						Fmt(_T("Failed to apply system theme."))
+					);
+				}
+				break;
+			}
+
+			if (wCommandId == IDM_TRAY_TOGGLE_NOTIFICATIONS) {
+				UpdateSetting(IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
+					(INT)!g_appSettings.notificationsEnabled
+				);
+				break;
+			}
+		}
+
+		else if (wNotificationCode == 1) {}  // Accelerator (rarely used explicitly)
+
+		else {}  // Control notification
+
+		break;
+	}
+
+	case WM_CREATE:
+	{
+		if (!InitializeGDIPlus(&pGdiPlusToken)) {
+			ShowMessageBoxNotification(
+				hWnd, MB_OK | MB_ICONERROR,
+				Fmt(_T("Initialization Error")),
+				Fmt(_T("Failed to initialize GDI+ library." EOL_ "%s"),
+					ErrorToText(GetLastError()))
+			);
+			return -1;
+		}
+
+		if (!InitializeNotifyIcon(&notifyIconData, hWnd, &hIcon)) {
+			ShowMessageBoxNotification(
+				hWnd, MB_OK | MB_ICONERROR,
+				Fmt(_T("Tray Icon Error")),
+				Fmt(_T("Failed to initialize system tray icon." EOL_ "%s"),
+					ErrorToText(GetLastError()))
+			);
+			return -1;
+		}
+
+		if (!AddClipboardFormatListener(hWnd)) {
+			ShowBalloonNotification(
+				&notifyIconData, NIIF_ERROR,
+				Fmt(_T("Clipboard Error")),
+				Fmt(_T("Failed to register clipboard listener." EOL_ "%s"),
+					ErrorToText(GetLastError()))
+			);
+			return -1;
+		}
+
+		if (!CF_PNG) {
+			ShowBalloonNotification(
+				&notifyIconData, NIIF_WARNING,
+				Fmt(_T("Clipboard Error")),
+				Fmt(_T("PNG format not available."))
+			);
+		}
+
+		ThemeResult themeResult = FollowSystemTheme(hWnd);
+		if (HasFlag(themeResult, ThemeResult::ThemeFailed)) {
+			ShowBalloonNotification(
+				&notifyIconData, NIIF_WARNING,
+				Fmt(_T("Theme Error")),
+				Fmt(_T("Failed to apply system theme."))
+			);
+		}
+
+		break;
+	}
+
+	case WM_DESTROY:
+	{
+		// Remove system tray icon
+		Shell_NotifyIcon(NIM_DELETE, &notifyIconData);
+		notifyIconData = {};
+
+		// Release tray icon resources
+		if (hIcon) {
+			DestroyIcon(hIcon);
+			hIcon = NULL;
+		}
+
+		// Shutdown GDI+ if initialized
+		if (pGdiPlusToken) {
+			Gdiplus::GdiplusShutdown(pGdiPlusToken);
+			pGdiPlusToken = NULL;
+		}
+
+		// Unregister dialog class
+		HINSTANCE hInstance = GetModuleHandle(NULL);
+		if (hInstance) {
+			LPCTSTR className = WhitelistEditDialog::DIALOG_CLASSNAME;
+			WNDCLASS wc{};
+			if (GetClassInfo(hInstance, className, &wc)) {
+				UnregisterClass(className, hInstance);
+			}
+		}
+
+		PostQuitMessage(nExitCode);
+		break;
+	}
+
+	case WM_SETTINGCHANGE:
+	{
+		if (lParam and CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam),
+			-1, _T("ImmersiveColorSet"), -1, TRUE) == CSTR_EQUAL)
+		{
+			// Re-apply the correct theme based on current system setting
+			HWND hwndFound = FindWindow(WhitelistEditDialog::DIALOG_CLASSNAME, NULL);
+			if (hwndFound) { FollowSystemTheme(hwndFound); }
+		}
 		break;
 	}
 
@@ -758,10 +1221,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		case WM_RBUTTONUP:
 		{
-			POINT cursorPosition;
-			GetCursorPos(&cursorPosition);
-			SetForegroundWindow(hWnd);
-			TrackPopupMenuEx(hTrayContextMenu, TPM_RIGHTBUTTON, cursorPosition.x, cursorPosition.y, hWnd, NULL);
+			if (!ShowTrayContextMenu(hWnd)) {
+				ShowBalloonNotification(
+					&notifyIconData, NIIF_ERROR,
+					Fmt(_T("Tray Menu Error")),
+					Fmt(_T("Failed to create system tray context menu." EOL_ "%s"),
+						ErrorToText(GetLastError()))
+				);
+				return 1;
+			}
 			break;
 		}
 		default: break;
@@ -769,172 +1237,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 
-	case WM_COMMAND:
+	case WM_APP_CUSTOM_MESSAGE:
 	{
-		if (HIWORD(wParam) == MENU)
-		{
-			if (LOWORD(wParam) == IDM_TRAY_EXIT) {
-				SendMessage(hWnd, WM_CLOSE, 0, 0);
-				break;
-			}
+		WORD wCommandId = LOWORD(wParam);
 
-			if (LOWORD(wParam) == IDM_TRAY_OPEN_FOLDER) {
-				TCHAR dirPath[MAX_PATH]{};
-				GetCurrentDirectory(MAX_PATH, dirPath);
-
-				if (!OpenFolderInExplorer(dirPath)) {
-					ShowBalloonNotification(
-						&notifyIconData, NIIF_WARNING,
-						_T("Explorer Error"), _T("Failed to open folder in File Explorer.\n%s"),
-						ErrorToText(GetLastError())
-					);
-				}
-				break;
-			}
-
-			if (LOWORD(wParam) == IDM_TRAY_RESTRICT_TO_SYSTEM) {
-				bool isChecked = !!(GetMenuState(hTrayContextMenu, IDM_TRAY_RESTRICT_TO_SYSTEM, MF_BYCOMMAND) & MF_CHECKED);
-				// Switch checkbox
-				CheckMenuItem(hTrayContextMenu, IDM_TRAY_RESTRICT_TO_SYSTEM,
-					MF_BYCOMMAND | (isChecked ? MF_UNCHECKED : MF_CHECKED)
-				);
-				if (IsFileExists(g_settings.iniPath)) {
-					WriteIniInt(
-						IniConfig::GENERAL, IniConfig::General::RESTRICT_TO_SYSTEM,
-						!isChecked, g_settings.iniPath
-					);
-				}
-				break;
-			}
-
-			if (LOWORD(wParam) == IDM_TRAY_SHOW_BALLOON) {
-				bool isChecked = !!(GetMenuState(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON, MF_BYCOMMAND) & MF_CHECKED);
-				// Switch checkbox
-				CheckMenuItem(hTrayContextMenu, IDM_TRAY_SHOW_BALLOON,
-					MF_BYCOMMAND | (isChecked ? MF_UNCHECKED : MF_CHECKED)
-				);
-				if (IsFileExists(g_settings.iniPath)) {
-					WriteIniInt(
-						IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
-						!isChecked, g_settings.iniPath
-					);
-				}
-				break;
-			}
-			break;
-		}
-
-		if (HIWORD(wParam) == CONTROL) {
-			if (LOWORD(wParam) == IDC_APP_MULTIPLE_INSTANCES) {
-				ShowBalloonNotification(
-					&notifyIconData, NIIF_WARNING,
-					_T("Multiple Instances Warning"), _T("Another instance of this application is already running.")
-				);
-				break;
-			}
-			break;
-		}
-
-		break;
-	}
-
-	case WM_CREATE:
-	{
-		if (!InitializeGDIPlus(&gdiplusToken)) {
-			ShowMessageBoxNotification(
-				hWnd, MB_OK | MB_ICONERROR,
-				_T("Initialization Error"), _T("Failed to initialize GDI+ library.\n%s"),
-				ErrorToText(GetLastError())
-			);
-			return -1;
-		}
-
-		if (!InitializeNotificationIcon(&notifyIconData, hWnd, &hIcon)) {
-			ShowMessageBoxNotification(
-				hWnd, MB_OK | MB_ICONERROR,
-				_T("Tray Icon Error"), _T("Failed to initialize system tray icon.\n%s"),
-				ErrorToText(GetLastError())
-			);
-			return -1;
-		}
-
-		if (!CreateTrayPopupMenu(&hTrayContextMenu)) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_ERROR,
-				_T("Tray Menu Error"), _T("Failed to create system tray context menu.\n%s"),
-				ErrorToText(GetLastError())
-			);
-			return -1;
-		}
-
-		if (!AddClipboardFormatListener(hWnd)) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_ERROR,
-				_T("Clipboard Error"), _T("Failed to register clipboard listener.\n%s"),
-				ErrorToText(GetLastError())
-			);
-			return -1;
-		}
-
-		if (!CF_PNG) {
+		if (wCommandId == ID_MULTIPLE_INSTANCES) {
 			ShowBalloonNotification(
 				&notifyIconData, NIIF_WARNING,
-				_T("Clipboard Format Error"), _T("PNG format not available.")
+				Fmt(_T("Multiple Instances Warning")),
+				Fmt(_T("Another instance of this application is already running."))
 			);
+			break;
+		}
+		if (wCommandId == ID_DIALOG_RESULT) {
+			// Check if the dialog was canceled (HIWORD(wParam) == 0)
+			if (!HIWORD(wParam)) {
+				return ERROR_SUCCESS;
+			}
+
+			// Retrieve dialog parameters stored in GWLP_USERDATA
+			PDialogParams pParams = reinterpret_cast<PDialogParams>(
+				GetWindowLongPtr((HWND)lParam, GWLP_USERDATA));
+			if (!pParams) { return 1; }  // Return 1 to indicate abortion
+			
+			// Validate the text in the buffer
+			if (!CheckTextCorrectness(pParams->szBuffer)) { return 1; }  // Abort if invalid
+
+			// Update the whitelist setting with the new string
+			UpdateSetting(IniConfig::WHITELIST, IniConfig::Whitelist::LIST,
+				pParams->szBuffer, pParams->cchMax);
+
+			// Indicate successful processing
+			return ERROR_SUCCESS;
 		}
 
-		HRESULT hrTheme = FollowSystemTheme(hWnd);
-		if (hrTheme != S_OK) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_WARNING,
-				_T("Theme Error"), _T("Failed to apply system theme.\n%s"),
-				hrTheme
-			);
-		}
-
-		break;
-	}
-
-	case WM_DESTROY:
-	{
-		// Clean up system tray context menu
-		if (hTrayContextMenu) {
-			DestroyMenu(hTrayContextMenu);
-			hTrayContextMenu = NULL;
-		}
-
-		// Remove system tray icon
-		Shell_NotifyIcon(NIM_DELETE, &notifyIconData);
-		notifyIconData = {};
-
-		// Release tray icon resources
-		if (hIcon) {
-			DestroyIcon(hIcon);
-			hIcon = NULL;
-		}
-
-		// Shutdown GDI+ if initialized
-		if (gdiplusToken) {
-			Gdiplus::GdiplusShutdown(gdiplusToken);
-			gdiplusToken = NULL;
-		}
-
-		PostQuitMessage(exitCode);
-		break;
-	}
-
-	case WM_SETTINGCHANGE:
-	{
-		if (lParam and
-			CompareStringOrdinal(
-				reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL
-			) {
-			// Re-apply the correct theme based on current system setting
-			FollowSystemTheme(hWnd);
-
-			// Redraw window to reflect theme changes immediately
-			//InvalidateRect(hWnd, nullptr, TRUE);
-		}
 		break;
 	}
 
@@ -953,79 +1289,84 @@ int _tmain(int argc, LPTSTR argv[])
 	if (!g_hMutex) {
 		ShowMessageBoxNotification(
 			NULL, MB_OK | MB_ICONERROR,
-			_T("Mutex operation failed"), _T("Unable to acquire lock.\n%s"),
-			ErrorToText(GetLastError())
+			Fmt(_T("Mutex operation failed")),
+			Fmt(_T("Unable to acquire lock." EOL_ "%s"), ErrorToText(GetLastError()))
 		);
 		return 1;
 	}
 
-	DWORD mutexErrorCode = GetLastError();
+	DWORD dwMutexResult = GetLastError();
 	// If the mutex already exists, another instance is running
-	if (mutexErrorCode == ERROR_ALREADY_EXISTS) {
-		g_hMainWnd = FindWindow(g_mainClassName, NULL);
+	if (dwMutexResult == ERROR_ALREADY_EXISTS) {
+		g_hMainWnd = FindWindow(MAIN_CLASS, NULL);
 		if (g_hMainWnd) {
-			PostMessage(g_hMainWnd, WM_COMMAND, MAKEWPARAM(IDC_APP_MULTIPLE_INSTANCES, CONTROL), (LPARAM)NULL);
+			PostMessage(g_hMainWnd, WM_APP_CUSTOM_MESSAGE,
+				MAKEWPARAM(ID_MULTIPLE_INSTANCES, 0), (LPARAM)NULL);
 		}
 		return 0;
 	}
 
-	// Retrieve the INI file path (filename same as executable)
-	if (!GetIniFilePath(g_settings.iniPath, MAX_PATH)) {
+	// Read settings if the file exists, or set defaults
+	if (!InitializeDefaultSettings()) {
 		ShowMessageBoxNotification(
 			NULL, MB_OK | MB_ICONERROR,
-			_T("Error Retrieving INI File"), _T("Failed to get INI file path.\n%s"),
-			ErrorToText(GetLastError())
+			Fmt(_T("Settings Error")),
+			Fmt(_T("Failed to initialize settings." EOL_ "%s"), ErrorToText(GetLastError()))
 		);
 		return 1;
 	}
 
-	// Read settings if the file exists, or set defaults
-	InitializeDefaultSettings();
-
-	// Initializes dark mode compatibility for the application
+	// Initializes theme compatibility for the application
 	EnableDarkModeSupport();
 
-	// Create hidden window
+	// Create dummy window
+	WNDCLASSEXW g_wcex{};
 	g_wcex = { sizeof(WNDCLASSEX) };
 	g_wcex.lpfnWndProc = WndProc;
 	g_wcex.hInstance = GetModuleHandle(NULL);
-	g_wcex.lpszClassName = g_mainClassName;
+	g_wcex.lpszClassName = MAIN_CLASS;
 	if (!RegisterClassEx(&g_wcex)) {
 		ShowMessageBoxNotification(
 			NULL, MB_OK | MB_ICONERROR,
-			_T("Window Class Registration Failed"), _T("Unable to register window class.\n%s"),
-			ErrorToText(GetLastError())
+			Fmt(_T("Window Class Registration Failed")),
+			Fmt(_T("Unable to register window class." EOL_ "%s"),
+				ErrorToText(GetLastError()))
 		);
 		return 1;
 	}
 
-	g_hMainWnd = CreateWindowEx(
-		0,
+	g_hMainWnd = CreateWindow(
 		g_wcex.lpszClassName,
 		NULL,
 		WS_POPUP,  // Invisible but valid parent
 		0, 0, 0, 0,
-		NULL, //HWND_MESSAGE,
-		NULL, NULL, NULL
+		NULL,
+		NULL, GetModuleHandle(NULL), NULL
 	);
 	if (!g_hMainWnd) {
 		ShowMessageBoxNotification(
 			NULL, MB_OK | MB_ICONERROR,
-			_T("Window Creation Failed"), _T("Unable to create main window.\n%s"),
-			ErrorToText(GetLastError())
+			Fmt(_T("Window Creation Failed")),
+			Fmt(_T("Unable to create main window." EOL_ "%s"),
+				ErrorToText(GetLastError()))
 		);
 		if (g_hMutex) {
 			ReleaseMutex(g_hMutex);
 			CloseHandle(g_hMutex);
 		}
+		ShowMessageBoxNotification(
+			NULL, MB_OK | MB_ICONERROR,
+			Fmt(_T("Window Creation Failed")),
+			Fmt(_T("Unable to create window class." EOL_ "%s"), ErrorToText(GetLastError()))
+		);
 		return 1;
 	}
 
-	MSG msg;
-	while (GetMessage(&msg, NULL, 0, 0))
+	MSG uMsg;
+	while (GetMessage(&uMsg, NULL, 0, 0))
 	{
-		TranslateMessage(&msg);
-		DispatchMessage(&msg);
+		TranslateMessage(&uMsg);
+		DispatchMessage(&uMsg);
 	}
 
 	// Cleanup
@@ -1033,6 +1374,7 @@ int _tmain(int argc, LPTSTR argv[])
 		RemoveClipboardFormatListener(g_hMainWnd);
 		DestroyWindow(g_hMainWnd);
 		UnregisterClass(g_wcex.lpszClassName, GetModuleHandle(NULL));
+		if (g_szLastError) { LocalFree(g_szLastError); }
 	}
 	if (g_hMutex) {
 		ReleaseMutex(g_hMutex);
