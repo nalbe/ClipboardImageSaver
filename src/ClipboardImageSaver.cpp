@@ -19,9 +19,6 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "Dwmapi.lib")
 
-// Linker directive
-#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:wmainCRTStartup")
-
 
 // Constants definitions
 UINT CF_PNG = []() {
@@ -41,8 +38,8 @@ namespace
 	AppSettings g_appSettings{};
 	LPTSTR g_szLastError{};
 
-	constexpr LPCTSTR MAIN_NAME  = _T("Clipboard Image Saver");
-	constexpr LPCTSTR MAIN_CLASS = _T("CISClassname");
+	constexpr LPCTSTR MAIN_NAME        = _T("Clipboard Image Saver");
+	constexpr LPCTSTR MAIN_CLASS_NAME  = _T("CISClassname");
 }
 
 
@@ -71,6 +68,10 @@ LPCTSTR MUTEX_NAME  = _T("CISInstance");
 LPCTSTR DARKMODE    = _T("DarkMode_Explorer");
 LPCTSTR LIGHTMODE   = _T("Explorer");
 LPCTSTR ERROR_BUFFER_PROP = _T("ErrorFree");
+
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
 
 
@@ -802,22 +803,25 @@ BOOL InitializeNotifyIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* pIc
 	if (!*pIcon) { return FALSE; }
 
 	// Initialize NOTIFYICONDATA with modern settings
-	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA);  // Specifies the size of the structure, required by Shell_NotifyIcon
-	pNotifyIconData->hWnd = hWnd;                      // Associates the tray icon with a window to receive callback messages
-	pNotifyIconData->uID = IDI_NOTIFY_ICON;            // A unique identifier for the tray icon
 	pNotifyIconData->uFlags =
 		NIF_ICON |		// The tray icon
 		NIF_MESSAGE |   // Event handling
 		NIF_TIP |       // Tooltip text
 		NIF_SHOWTIP;    // Ensures the tooltip appears when hovering (Windows 10/11 enhancement)
-	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;   // Defines the custom message
-	pNotifyIconData->hIcon = *pIcon;                       // Specifies the icon to display in the tray (paired with NIF_ICON)
-	_tcscpy_s(pNotifyIconData->szTip, MAIN_NAME);          // Sets the tooltip text (paired with NIF_TIP)
+
+	_tcscpy_s(pNotifyIconData->szTip, MAIN_NAME);         // Sets the tooltip text (paired with NIF_TIP)
+	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA);     // Specifies the size of the structure, required by Shell_NotifyIcon
+	pNotifyIconData->hWnd = hWnd;                         // Associates the tray icon with a window to receive callback messages
+	pNotifyIconData->uID = IDI_NOTIFY_ICON;               // A unique identifier for the tray icon
+	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;  // Defines the custom message
+	pNotifyIconData->hIcon = *pIcon;                      // Specifies the icon to display in the tray (paired with NIF_ICON)
 	// Required for Windows 10/11
-	pNotifyIconData->dwState = NIS_SHAREDICON;             // Indicates the icon is shared and shouldn’t be deleted when the notification is removed
-	pNotifyIconData->dwStateMask = NIS_SHAREDICON;         // Specifies which state bits to modify
+	pNotifyIconData->dwState = NIS_SHAREDICON;            // Indicates the icon is shared and shouldn’t be deleted when the notification is removed
+	pNotifyIconData->dwStateMask = NIS_SHAREDICON;        // Specifies which state bits to modify
+
 	// First add the icon to the tray
 	if (!Shell_NotifyIcon(NIM_ADD, pNotifyIconData)) { return FALSE; }  // Adds the tray icon to the system tray
+
 	// Set version AFTER adding
 	pNotifyIconData->uVersion = NOTIFYICON_VERSION_4;      // Sets the tray icon version to enable modern features (e.g., balloon tips, improved behavior on Windows 10/11)
 
@@ -937,6 +941,30 @@ BOOL CheckTextCorrectness(LPCTSTR lpcszText)
 	return TRUE;
 }
 
+// Create Main window
+HWND CreateDummyWindow(HINSTANCE hInstance)
+{
+	return CreateWindow(
+		MAIN_CLASS_NAME,
+		MAIN_NAME,
+		WS_POPUP,  // Invisible but valid parent
+		0, 0, 0, 0,
+		(HWND)NULL, (HMENU)NULL, hInstance, (LPVOID)NULL
+	);
+}
+
+// Register Window Class
+ATOM RegisterWindowClass(HINSTANCE hInstance, WNDCLASSEX* wcex)
+{
+	wcex->cbSize = sizeof(WNDCLASSEX);
+	wcex->lpfnWndProc = WndProc;                      // Window procedure
+	wcex->hInstance = hInstance;                      // App instance
+	wcex->lpszClassName = MAIN_CLASS_NAME;            // Class name
+	wcex->hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
+
+	return RegisterClassEx(wcex);
+}
+
 
 // Window procedure
 LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -956,9 +984,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 	{
 		static const UINT uMaxFormatStringLength = 64;
 		static TCHAR szClipboardFormatBuffer[uMaxFormatStringLength];
+		const ULONGLONG ulMinTimeBetweenUpdates = 50; // 50ms
 
 		// Debounce
-		const ULONGLONG ulMinTimeBetweenUpdates = 50; // 50ms
 		if (!IsTimeElapsed(ulMinTimeBetweenUpdates)) {
 			break;
 		}
@@ -1042,8 +1070,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_COMMAND:
 	{
-		WORD wCommandId = LOWORD(wParam);
 		WORD wNotificationCode = HIWORD(wParam);
+		WORD wCommandId = LOWORD(wParam);
 
 		if (wNotificationCode == 0) {  // Menu/accelerator
 			if (wCommandId == IDM_TRAY_EXIT) {
@@ -1168,20 +1196,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_DESTROY:
 	{
+		if (!RemoveClipboardFormatListener(hWnd)) {}
+
 		// Remove system tray icon
 		Shell_NotifyIcon(NIM_DELETE, &notifyIconData);
-		notifyIconData = {};
 
 		// Release tray icon resources
 		if (hIcon) {
-			DestroyIcon(hIcon);
-			hIcon = NULL;
+			if (!DestroyIcon(hIcon)) {}
 		}
 
 		// Shutdown GDI+ if initialized
 		if (pGdiPlusToken) {
 			Gdiplus::GdiplusShutdown(pGdiPlusToken);
-			pGdiPlusToken = NULL;
 		}
 
 		// Unregister dialog class
@@ -1194,6 +1221,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			}
 		}
 
+		g_hMainWnd = NULL;
 		PostQuitMessage(nExitCode);
 		break;
 	}
@@ -1247,11 +1275,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 				Fmt(_T("Multiple Instances Warning")),
 				Fmt(_T("Another instance of this application is already running."))
 			);
-			break;
+			return 0;
 		}
 		if (wCommandId == ID_DIALOG_RESULT) {
-			// Check if the dialog was canceled (HIWORD(wParam) == 0)
-			if (!HIWORD(wParam)) {
+			if (!HIWORD(wParam)) {  // If the dialog was canceled
 				return ERROR_SUCCESS;
 			}
 
@@ -1271,7 +1298,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			return ERROR_SUCCESS;
 		}
 
-		break;
+		return 1;
 	}
 
 	default:
@@ -1282,23 +1309,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 
 // Main Application Entry Point
-int _tmain(int argc, LPTSTR argv[])
+int WINAPI WinMain(
+	_In_ HINSTANCE hInstance,
+	_In_opt_ HINSTANCE hPrevInstance,
+	_In_ LPSTR lpCmdLine,
+	_In_ int nCmdShow)
 {
 	// Create a mutex with no security attributes
 	g_hMutex = CreateMutex(NULL, TRUE, MUTEX_NAME);
 	if (!g_hMutex) {
-		ShowMessageBoxNotification(
-			NULL, MB_OK | MB_ICONERROR,
+		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
 			Fmt(_T("Mutex operation failed")),
-			Fmt(_T("Unable to acquire lock." EOL_ "%s"), ErrorToText(GetLastError()))
-		);
+			Fmt(_T("Unable to acquire lock." EOL_ "%s"), ErrorToText(GetLastError())));
 		return 1;
 	}
 
 	DWORD dwMutexResult = GetLastError();
 	// If the mutex already exists, another instance is running
 	if (dwMutexResult == ERROR_ALREADY_EXISTS) {
-		g_hMainWnd = FindWindow(MAIN_CLASS, NULL);
+		g_hMainWnd = FindWindow(MAIN_CLASS_NAME, NULL);
 		if (g_hMainWnd) {
 			PostMessage(g_hMainWnd, WM_APP_CUSTOM_MESSAGE,
 				MAKEWPARAM(ID_MULTIPLE_INSTANCES, 0), (LPARAM)NULL);
@@ -1308,61 +1337,45 @@ int _tmain(int argc, LPTSTR argv[])
 
 	// Read settings if the file exists, or set defaults
 	if (!InitializeDefaultSettings()) {
-		ShowMessageBoxNotification(
-			NULL, MB_OK | MB_ICONERROR,
+		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
 			Fmt(_T("Settings Error")),
-			Fmt(_T("Failed to initialize settings." EOL_ "%s"), ErrorToText(GetLastError()))
-		);
+			Fmt(_T("Failed to initialize settings." EOL_ "%s"), ErrorToText(GetLastError())));
 		return 1;
 	}
 
-	// Initializes theme compatibility for the application
-	EnableDarkModeSupport();
+	// Enable dark mode support
+	if (!EnableDarkModeSupport()) {
+		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONWARNING,
+			Fmt(_T("Theme Error")),
+			Fmt(_T("Failed to enable theme support." EOL_ "%s"), ErrorToText(GetLastError())));
+	}
 
-	// Create dummy window
+	// Register class
 	WNDCLASSEXW g_wcex{};
-	g_wcex = { sizeof(WNDCLASSEX) };
-	g_wcex.lpfnWndProc = WndProc;
-	g_wcex.hInstance = GetModuleHandle(NULL);
-	g_wcex.lpszClassName = MAIN_CLASS;
-	if (!RegisterClassEx(&g_wcex)) {
-		ShowMessageBoxNotification(
-			NULL, MB_OK | MB_ICONERROR,
+	if (!RegisterWindowClass(hInstance, &g_wcex)) {
+		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
 			Fmt(_T("Window Class Registration Failed")),
 			Fmt(_T("Unable to register window class." EOL_ "%s"),
-				ErrorToText(GetLastError()))
-		);
+				ErrorToText(GetLastError())));
 		return 1;
 	}
 
-	g_hMainWnd = CreateWindow(
-		g_wcex.lpszClassName,
-		NULL,
-		WS_POPUP,  // Invisible but valid parent
-		0, 0, 0, 0,
-		NULL,
-		NULL, GetModuleHandle(NULL), NULL
-	);
+	// Create window
+	g_hMainWnd = CreateDummyWindow(hInstance);
 	if (!g_hMainWnd) {
-		ShowMessageBoxNotification(
-			NULL, MB_OK | MB_ICONERROR,
+		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
 			Fmt(_T("Window Creation Failed")),
 			Fmt(_T("Unable to create main window." EOL_ "%s"),
-				ErrorToText(GetLastError()))
-		);
+				ErrorToText(GetLastError())));
 		if (g_hMutex) {
 			ReleaseMutex(g_hMutex);
 			CloseHandle(g_hMutex);
 		}
-		ShowMessageBoxNotification(
-			NULL, MB_OK | MB_ICONERROR,
-			Fmt(_T("Window Creation Failed")),
-			Fmt(_T("Unable to create window class." EOL_ "%s"), ErrorToText(GetLastError()))
-		);
 		return 1;
 	}
 
 	MSG uMsg;
+	// Message loop
 	while (GetMessage(&uMsg, NULL, 0, 0))
 	{
 		TranslateMessage(&uMsg);
@@ -1370,12 +1383,8 @@ int _tmain(int argc, LPTSTR argv[])
 	}
 
 	// Cleanup
-	if (g_hMainWnd) {
-		RemoveClipboardFormatListener(g_hMainWnd);
-		DestroyWindow(g_hMainWnd);
-		UnregisterClass(g_wcex.lpszClassName, GetModuleHandle(NULL));
-		if (g_szLastError) { LocalFree(g_szLastError); }
-	}
+	UnregisterClass(MAIN_CLASS_NAME, GetModuleHandle(NULL));
+	if (g_szLastError) { LocalFree(g_szLastError); }
 	if (g_hMutex) {
 		ReleaseMutex(g_hMutex);
 		CloseHandle(g_hMutex);
