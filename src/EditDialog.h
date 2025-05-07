@@ -1,5 +1,12 @@
 #pragma once
 
+// Windows system headers
+#include <windows.h>
+
+// Standard library headers
+#include <tchar.h>
+
+
 
 // Structure to store buffer information and its size
 typedef struct 
@@ -9,16 +16,10 @@ typedef struct
 } DialogParams, *PDialogParams;
 
 
-// Define a callback function type for handling theme change events
-typedef BOOL (CALLBACK *ThemeChangedCallback)(HWND hWnd, LPARAM lParam);
 
+extern LPCWSTR DIALOG_CLASSNAME;
+extern LPCWSTR DIALOG_NAME;
 
-// Namespace for whitelist edit dialog
-namespace WhitelistEditDialog
-{
-	inline constexpr LPCWSTR DIALOG_CLASSNAME = L"CISWhitelistEditClass";
-	inline constexpr LPCWSTR DIALOG_NAME      = L"Whitelist Edit";
-}
 
 
 // Function declaration to display a custom dialog

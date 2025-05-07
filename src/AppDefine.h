@@ -33,7 +33,7 @@
    * Custom command IDs (LOWORD)
    *----------------------------------------------------------------------------*/
 #define ID_MULTIPLE_INSTANCES       (3000 + 1)  // Multiple instances control
-#define ID_SYSTEM_THEME             (3000 + 2)  // System theme changes
+#define ID_THEME_CHANGED            (3000 + 2)  // System theme changes
 #define ID_DIALOG_RESULT            (3000 + 3)  // Editing is finished
 
 

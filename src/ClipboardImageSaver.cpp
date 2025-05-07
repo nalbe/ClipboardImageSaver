@@ -1,23 +1,27 @@
 
 // Implementation-specific headers
-#include "AppDefine.h"           // Application-wide definitions and constants
-#include "ClipboardImageSaver.h" // Main header
-#include "resource.h"            // Resource identifiers
-#include "murmurhash3.h"         // MurmurHash3 implementation for hashing
-#include "IniSettings.h"         // INI file settings management
-#include "EditDialog.h"          // Edit dialog window
+#include "ClipboardImageSaver.h"                         // Main header
+#include "resource.h"                                    // Resource identifiers
+#include "AppDefine.h"                                   // Application-wide definitions and constants
+#include "EditDialog.h"                                  // Edit dialog window
+#include "CustomIncludes\murmurhash3.h"                  // MurmurHash3 implementation for hashing
+#include "CustomIncludes\WinApi\ThemeManager.h"          // Dark mode support
+#include "CustomIncludes\WinApi\MessageBoxNotifier.h"    // MessageBox notification handler
+#include "CustomIncludes\WinApi\BalloonNotifier.h"       // BalloonNotification handler
+#include "CustomIncludes\WinApi\Debouncer.h"             // Debounce helper
+#include "CustomIncludes\WinApi\IniFileManager.h"        // .ini file settings management
+
+// Standard library headers
+#include <unordered_set>         // Container
 
 // Windows system headers
-#include <shellapi.h>           // Shell operations (e.g., tray icons)
-#include <versionhelpers.h>     // Windows version checking helpers
-#include <gdiplus.h>            // GDI+ for graphics and image processing
-#include <uxtheme.h>            // Visual styles and theme support
-#include <dwmapi.h>             // Desktop Window Manager APIs (e.g., dark mode)
+#include <windows.h>             // Core Windows API definitions (e.g., HWND, WPARAM, SendMessage)
+#include <gdiplus.h>             // GDI+ for graphics and image processing
+#include <tchar.h>               // TCHAR support for Unicode/ANSI compatibility (e.g., _T macro)
 
 // Library links
 #pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "uxtheme.lib")
-#pragma comment(lib, "Dwmapi.lib")
+
 
 
 // Constants definitions
@@ -30,16 +34,22 @@ UINT CF_PNG = []() {
 	}();
 
 
-// Application state
-namespace
-{
-	HWND g_hMainWnd = NULL;
-	HANDLE g_hMutex = NULL;
-	AppSettings g_appSettings{};
-	LPTSTR g_szLastError{};
 
-	constexpr LPCTSTR MAIN_NAME        = _T("Clipboard Image Saver");
-	constexpr LPCTSTR MAIN_CLASS_NAME  = _T("CISClassname");
+// Application state
+namespace Settings
+{
+	const DWORD WhiteListMaxChars = MAX_PATH;
+
+	TCHAR procWhiteList[WhiteListMaxChars];
+	BOOL isNotificationsEnabled{};
+	BOOL isWhitelistEnabled{};
+	std::unordered_set<RawData, MurmurHash3_32> whitelistHashes{};
+	IniFileManager ini{};
+
+	// Application-wide constants for naming and identification
+	LPCTSTR MainName            = _T("Clipboard Image Saver");
+	LPCTSTR MainClassName       = _T("CISClassname");
+	LPCTSTR MutexName           = _T("CISInstance");
 }
 
 
@@ -63,226 +73,26 @@ namespace IniConfig
 }
 
 
-// Application-wide constants for naming and identification
-LPCTSTR MUTEX_NAME  = _T("CISInstance");
-LPCTSTR DARKMODE    = _T("DarkMode_Explorer");
-LPCTSTR LIGHTMODE   = _T("Explorer");
-LPCTSTR ERROR_BUFFER_PROP = _T("ErrorFree");
+using EMC_ = ErrorMessageConverter;
+
+
+// Enum declarations
+enum class ClipboardResult : unsigned
+{
+	Success,
+	NoData,
+	ConversionFailed,
+	LockFailed,
+	UnchangedContent,
+	SaveFailed,
+	InvalidParameter
+};
 
 
 // Forward declarations
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
 
-
-
-// Converts a DWORD error code into a human-readable error message string
-LPCTSTR ErrorToText(DWORD dwErrorCode)
-{
-	if (g_szLastError) {
-		LocalFree(g_szLastError);
-		g_szLastError = NULL;
-	}
-
-	// Retrieve the system error message for `dwErrorCode`
-	FormatMessage(
-		FORMAT_MESSAGE_ALLOCATE_BUFFER |   // Allocate buffer automatically
-		FORMAT_MESSAGE_FROM_SYSTEM |       // Use system error message table
-		FORMAT_MESSAGE_IGNORE_INSERTS,     // Ignore any insert sequences in the message
-		NULL,                              // No specific message source (using system)
-		dwErrorCode,                       // The error code to convert
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),     // Default language (neutral, system default)
-		reinterpret_cast<LPTSTR>(&g_szLastError),  // Output buffer for the error message
-		0,                                 // Minimum buffer size (ignored due to ALLOCATE_BUFFER)
-		NULL                               // No additional arguments for message inserts
-	);
-
-	return g_szLastError;
-}
-
-// Displays a message box with formatted title and message for error reporting
-template <typename... TitleArgs, typename... MsgArgs>
-INT ShowMessageBoxNotification(HWND hWnd, UINT uFlags,
-	Fmt<TitleArgs...> titleFmt, Fmt<MsgArgs...> messageFmt)
-{
-	TCHAR szTitle[64]{};    // Buffer for the formatted title (max 64 characters)
-	TCHAR szMessage[256]{}; // Buffer for the formatted message (max 256 characters)
-
-	// Format title using stored arguments
-	std::apply([&](auto&&... args) {
-		_stprintf_s(
-			szTitle, _countof(szTitle),
-			titleFmt.format ? titleFmt.format : _T(""),
-			args...
-		);
-		}, titleFmt.args);
-
-	// Format message using stored arguments
-	std::apply([&](auto&&... args) {
-		_stprintf_s(
-			szMessage, _countof(szMessage),
-			messageFmt.format ? messageFmt.format : _T(""),
-			args...
-		);
-		}, messageFmt.args);
-
-	// Free the local string buffer used for the last error message
-	if (g_szLastError) {
-		LocalFree(g_szLastError);
-		g_szLastError = NULL;
-	}
-
-	// Display the message box and return the user’s response (e.g., IDOK, IDCANCEL)
-	return MessageBox(hWnd, szMessage, szTitle, uFlags);
-}
-
-// Displays a balloon notification with formatted title and message for error reporting
-template<typename... TitleArgs, typename... MessageArgs>
-BOOL ShowBalloonNotification( NOTIFYICONDATA* pNotifyIconData, DWORD dwInfoFlags,
-	Fmt<TitleArgs...> titleFmt, Fmt<MessageArgs...> messageFmt)
-{
-	if (!pNotifyIconData) { return FALSE; }
-	
-	pNotifyIconData->dwInfoFlags = dwInfoFlags;  // Set notification icon flags (e.g., NIIF_INFO, NIIF_WARNING)
-	pNotifyIconData->uFlags = NIF_INFO;           // Enables balloon tip fields (szInfo, uTimeout, szInfoTitle, dwInfoFlags)
-	pNotifyIconData->uTimeout = 2000;             // 10000 ms max
-
-	// Format title
-	std::apply([&](auto&&... args) {
-		_stprintf_s(
-			pNotifyIconData->szInfoTitle,
-			_countof(pNotifyIconData->szInfoTitle),
-			titleFmt.format ? titleFmt.format : _T(""),
-			args...
-		);
-		}, titleFmt.args);
-
-	// Format message
-	std::apply([&](auto&&... args) {
-		_stprintf_s(
-			pNotifyIconData->szInfo,
-			_countof(pNotifyIconData->szInfo),
-			messageFmt.format ? messageFmt.format : _T(""),
-			args...
-		);
-		}, messageFmt.args);
-
-	// Free the local string buffer used for the last error message, if it exists
-	if (g_szLastError) {
-		LocalFree(g_szLastError);
-		g_szLastError = NULL;
-	}
-
-	// Update the system tray notification
-	return Shell_NotifyIcon(NIM_MODIFY, pNotifyIconData);
-}
-
-// Enables dark mode support for the application
-BOOL EnableDarkModeSupport()
-{
-	INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_STANDARD_CLASSES };
-	if (!InitCommonControlsEx(&icex)) { return FALSE; }
-
-	HMODULE hUxtheme = LoadLibraryEx(_T("uxtheme.dll"), NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-	if (!hUxtheme) { return FALSE; }
-
-	// Manually define the function prototype and enum (since they are not in the SDK)
-	typedef enum _APP_MODE { Default, AllowDark, ForceDark, ForceLight, Max } APP_MODE;
-	// Define the function type for SetPreferredAppMode (Ordinal 135 for Windows 10/11)
-	typedef APP_MODE(WINAPI* PFN_SetPreferredAppMode)(APP_MODE appMode);
-
-	// Retrieves the function pointer from the DLL using its ordinal value
-	auto _SetPreferredAppMode = reinterpret_cast<PFN_SetPreferredAppMode>(
-		GetProcAddress(hUxtheme, MAKEINTRESOURCEA(135))
-		);
-
-	if (_SetPreferredAppMode) {
-		_SetPreferredAppMode(AllowDark);
-	}
-
-	FreeLibrary(hUxtheme);
-	return TRUE;
-}
-
-// Determines if the system is currently using a dark theme
-BOOL IsSystemDarkThemeEnabled()
-{
-	HMODULE hUxtheme = LoadLibraryEx(_T("uxtheme.dll"), NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-	if (!hUxtheme) { return FALSE; }
-
-	// Defines the function signature for ShouldAppsUseDarkMode (ordinal 132)
-	typedef BOOL(WINAPI* PFN_ShouldAppsUseDarkMode)();
-
-	// Retrieves the function pointer from the DLL using its ordinal value
-	auto _ShouldAppsUseDarkMode = reinterpret_cast<PFN_ShouldAppsUseDarkMode>(
-		GetProcAddress(hUxtheme, MAKEINTRESOURCEA(132)));
-
-	// Calls the function if it exists, otherwise defaults to FALSE (light mode)
-	BOOL isDark = _ShouldAppsUseDarkMode ? _ShouldAppsUseDarkMode() : FALSE;
-
-	FreeLibrary(hUxtheme);
-	return isDark & 0xff;
-}
-
-// Window theme enumeration callback
-BOOL CALLBACK ThemeEnumCallback(HWND hWnd, LPARAM lParam)
-{
-	PDWORD pPacked = reinterpret_cast<PDWORD>(lParam);
-	// Unpack high 2 bytes (theme state)
-	const WORD isDarkTheme = HIWORD(*pPacked);
-	// Unpack low 2 bytes (error flag)
-	WORD& rError = *reinterpret_cast<WORD*>(pPacked);
-
-	HRESULT hr = SetWindowTheme(
-		hWnd,
-		isDarkTheme ? DARKMODE : LIGHTMODE,
-		NULL
-	);
-
-	// If successful, recursively enumerate and theme this window's children
-	if (SUCCEEDED(hr)) {
-		EnumChildWindows(
-			hWnd,
-			ThemeEnumCallback,
-			lParam
-		);
-	}
-	else { rError = TRUE; }
-
-	return TRUE;
-}
-
-// Applies the system theme (light or dark) to the specified window
-ThemeResult FollowSystemTheme(HWND hWnd)
-{
-	ThemeResult error = ThemeResult::None;
-
-	// Check if the system is currently using a dark theme
-	BOOL isDarkTheme = IsSystemDarkThemeEnabled();
-
-	// Apply DWM attributes (Windows 10+)
-	if (IsWindows10OrGreater()) {
-		HRESULT dwmHr = DwmSetWindowAttribute(
-			hWnd,
-			DWMWA_USE_IMMERSIVE_DARK_MODE, // Affects the non-client area(title bar, borders) and global window attributes
-			&isDarkTheme,
-			sizeof(isDarkTheme)
-		);
-		if (dwmHr == DWM_E_COMPOSITIONDISABLED) { error |= ThemeResult::DwmAttributeDisabled; }
-		else if (FAILED(dwmHr)) { error |= ThemeResult::DwmAttributeFailed; }
-	}
-
-	// Notify the dialog of a theme change by sending a custom message
-	LRESULT lResult = SendMessage(
-		hWnd,
-		WM_APP_CUSTOM_MESSAGE,
-		MAKEWPARAM(ID_SYSTEM_THEME, isDarkTheme),
-		(LPARAM)ThemeEnumCallback
-	);
-	if (lResult != ERROR_SUCCESS) { error |= ThemeResult::ThemeFailed; }
-
-	return error;
-}
 
 // Opens the specified folder in Windows Explorer.
 BOOL OpenFolderInExplorer()
@@ -362,30 +172,20 @@ BOOL RestoreTextFromStorage(LPCTSTR cszSrc, LPTSTR szDest, DWORD cchMax)
 	return TRUE;
 }
 
-// Fast 32-bit hash function (for binary data)
-UINT32 ComputeDataHash(LPCBYTE lpcbData, SIZE_T cbDataSize)
-{
-	if (!lpcbData) { return 0; }
-
-	UINT32 seed = 0; // Fixed seed for consistency
-	UINT32 hash = MurmurHash3_32(lpcbData, cbDataSize, seed);
-	return hash;
-}
-
 // Updates the whitelist hash cache
 void UpdateWhitelistCache()
 {
 	LPCTSTR cszDelim = _T("\r\n");
 	LPTSTR szContext = NULL;
-	LPTSTR szCopy = _tcsdup(g_appSettings.processWhitelist);
+	LPTSTR szCopy = _tcsdup(Settings::procWhiteList);
 
-	g_appSettings.whitelistHashes.clear();
+	Settings::whitelistHashes.clear();
 	LPTSTR szToken = _tcstok_s(szCopy, cszDelim, &szContext);
 	while (szToken) {
-		g_appSettings.whitelistHashes.insert(ComputeDataHash(
+		Settings::whitelistHashes.insert({
 			reinterpret_cast<const PBYTE>(szToken),
 			_tcslen(szToken) * sizeof(TCHAR)
-		));
+		});
 		szToken = _tcstok_s(NULL, cszDelim, &szContext);
 	}
 
@@ -397,19 +197,19 @@ void UpdateSetting(LPCTSTR cszSection, LPCTSTR cszKey, INT nData)
 {
 	if (cszSection == IniConfig::WHITELIST) {
 		if (cszKey == IniConfig::Whitelist::ENABLED) {
-			g_appSettings.whitelistEnabled = (BOOL)nData;
+			Settings::isWhitelistEnabled = (BOOL)nData;
 		}
 	}
 	else if (cszSection == IniConfig::NOTIFICATIONS) {
 		if (cszKey == IniConfig::Notifications::ENABLED) {
-			g_appSettings.notificationsEnabled = (BOOL)nData;
+			Settings::isNotificationsEnabled = (BOOL)nData;
 		}
 	}
 
 	// Prevent automatic file creation in WriteIni* functions
-	if (!g_appSettings.configFileExists) { return; }
+	if (!Settings::ini.IsFileExists()) { return; }
 
-	WriteIniInt(cszSection, cszKey, (INT)nData, g_appSettings.configFilePath);
+	Settings::ini.WriteInt(cszSection, cszKey, (INT)nData);
 }
 
 // Updates a specific string setting in a configuration file
@@ -419,25 +219,16 @@ void UpdateSetting(LPCTSTR cszSection, LPCTSTR cszKey, LPTSTR szText, DWORD cchT
 
 	if (cszSection == IniConfig::WHITELIST) {
 		if (cszKey == IniConfig::Whitelist::LIST) {
-			_tcscpy_s(g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH, szText);
+			_tcscpy_s(Settings::procWhiteList, Settings::WhiteListMaxChars, szText);
 			UpdateWhitelistCache();
-			FormatTextForStorage(g_appSettings.processWhitelist, szText, cchTextMax);
+			FormatTextForStorage(Settings::procWhiteList, szText, cchTextMax);
 		}
 	}
 
 	// Prevent automatic file creation in WriteIni* functions
-	if (!g_appSettings.configFileExists) { return; }
+	if (!Settings::ini.IsFileExists()) { return; }
 
-	WriteIniString(cszSection, cszKey, szText, g_appSettings.configFilePath);
-}
-
-// Check if the file exists and is not a directory
-BOOL IsFileExists(LPCTSTR cszFilePath) {
-	if (!cszFilePath) { return FALSE; }
-
-	DWORD attributes = GetFileAttributes(cszFilePath);
-	return (attributes != INVALID_FILE_ATTRIBUTES and
-		!(attributes & FILE_ATTRIBUTE_DIRECTORY));
+	Settings::ini.WriteString(cszSection, cszKey, szText);
 }
 
 // Function to compute hash of an LPCTSTR and check existence in the whitelist
@@ -445,11 +236,12 @@ BOOL IsStringWhitelisted(LPCTSTR cszText)
 {
 	if (!cszText) { return FALSE; }
 
-	SIZE_T cbSize = _tcslen(cszText) * sizeof(TCHAR); // Calculate byte size
-	UINT32 uHash = ComputeDataHash(reinterpret_cast<LPCBYTE>(cszText), cbSize);
-	auto& usCache = g_appSettings.whitelistHashes;
+	auto it = Settings::whitelistHashes.find({
+		reinterpret_cast<LPCBYTE>(cszText),
+		_tcslen(cszText) * sizeof(TCHAR)
+	});
 
-	return usCache.find(uHash) != usCache.end();  // Check if hash exists in whitelist
+	return it != Settings::whitelistHashes.end();  // Check if hash exists in whitelist
 }
 
 // Generates a filename string
@@ -509,35 +301,25 @@ LPCTSTR GenerateFilename()
 // Initialize global settings with defaults or values read from the INI file
 BOOL InitializeDefaultSettings()
 {
-	if (!GetIniFilePath(g_appSettings.configFilePath,
-		g_appSettings.MAX_CONFIG_PATH_LENGTH))
-	{ return FALSE; }
-
-	g_appSettings.configFileExists = 
-		IsFileExists(
-			g_appSettings.configFilePath
-		);
-	g_appSettings.notificationsEnabled =
-		ReadIniInt(
+	Settings::isNotificationsEnabled =
+		Settings::ini.ReadInt(
 			IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
-			TRUE, g_appSettings.configFilePath
+			TRUE
 		);
-	g_appSettings.whitelistEnabled =
-		ReadIniInt(
+	Settings::isWhitelistEnabled =
+		Settings::ini.ReadInt(
 			IniConfig::WHITELIST, IniConfig::Whitelist::ENABLED,
-			TRUE, g_appSettings.configFilePath
+			TRUE
 		);
 
-	const DWORD cchBuffer = g_appSettings.MAX_WHITELIST_LENGTH;
+	const DWORD cchBuffer = Settings::WhiteListMaxChars;
 	TCHAR szBuffer[cchBuffer];
-	ReadIniString(
+	Settings::ini.ReadString(
 		IniConfig::WHITELIST, IniConfig::Whitelist::LIST,
 		_T("svchost.exe"),
-		szBuffer, cchBuffer,
-		g_appSettings.configFilePath
+		szBuffer, cchBuffer
 	);
-	RestoreTextFromStorage(szBuffer,
-		g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH);
+	RestoreTextFromStorage(szBuffer, Settings::procWhiteList, Settings::WhiteListMaxChars);
 	UpdateWhitelistCache();
 
 	return TRUE;
@@ -756,11 +538,11 @@ ClipboardResult HandleClipboardData(LPTSTR szFormat, UINT cchFormat)
 
 	// Calculate content hash
 	const SIZE_T cbDataSize = GlobalSize(hClipboardData);
-	const DWORD dwDataHash = ComputeDataHash(lpcbData, cbDataSize);
+	const DWORD dwDataHash = (DWORD)MurmurHash3_32{}.computeHash(lpcbData, cbDataSize);
 	GlobalUnlock(hClipboardData);
 
 	// Check for duplicate content
-	if (cbDataSize == cbLastDataSize && dwDataHash == dwLastDataHash) {
+	if (cbDataSize == cbLastDataSize and dwDataHash == dwLastDataHash) {
 		GlobalFree(hClipboardData);
 		return ClipboardResult::UnchangedContent;
 	}
@@ -809,15 +591,15 @@ BOOL InitializeNotifyIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* pIc
 		NIF_TIP |       // Tooltip text
 		NIF_SHOWTIP;    // Ensures the tooltip appears when hovering (Windows 10/11 enhancement)
 
-	_tcscpy_s(pNotifyIconData->szTip, MAIN_NAME);         // Sets the tooltip text (paired with NIF_TIP)
-	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA);     // Specifies the size of the structure, required by Shell_NotifyIcon
-	pNotifyIconData->hWnd = hWnd;                         // Associates the tray icon with a window to receive callback messages
-	pNotifyIconData->uID = IDI_NOTIFY_ICON;               // A unique identifier for the tray icon
-	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;  // Defines the custom message
-	pNotifyIconData->hIcon = *pIcon;                      // Specifies the icon to display in the tray (paired with NIF_ICON)
+	_tcscpy_s(pNotifyIconData->szTip, Settings::MainName);  // Sets the tooltip text (paired with NIF_TIP)
+	pNotifyIconData->cbSize = sizeof(NOTIFYICONDATA);        // Specifies the size of the structure, required by Shell_NotifyIcon
+	pNotifyIconData->hWnd = hWnd;                            // Associates the tray icon with a window to receive callback messages
+	pNotifyIconData->uID = IDI_NOTIFY_ICON;                  // A unique identifier for the tray icon
+	pNotifyIconData->uCallbackMessage = WM_APP_TRAYICON;     // Defines the custom message
+	pNotifyIconData->hIcon = *pIcon;                         // Specifies the icon to display in the tray (paired with NIF_ICON)
 	// Required for Windows 10/11
-	pNotifyIconData->dwState = NIS_SHAREDICON;            // Indicates the icon is shared and shouldn’t be deleted when the notification is removed
-	pNotifyIconData->dwStateMask = NIS_SHAREDICON;        // Specifies which state bits to modify
+	pNotifyIconData->dwState = NIS_SHAREDICON;               // Indicates the icon is shared and shouldn’t be deleted when the notification is removed
+	pNotifyIconData->dwStateMask = NIS_SHAREDICON;           // Specifies which state bits to modify
 
 	// First add the icon to the tray
 	if (!Shell_NotifyIcon(NIM_ADD, pNotifyIconData)) { return FALSE; }  // Adds the tray icon to the system tray
@@ -829,12 +611,12 @@ BOOL InitializeNotifyIcon(NOTIFYICONDATA* pNotifyIconData, HWND hWnd, HICON* pIc
 }
 
 // Initializes the GDI+ library for image processing
-BOOL InitializeGDIPlus(ULONG_PTR* pGdiPlusToken)
+Gdiplus::Status InitializeGDIPlus(ULONG_PTR* pGdiPlusToken)
 {
-	if (!pGdiPlusToken) { return FALSE; }
+	if (!pGdiPlusToken) { return Gdiplus::Status::InvalidParameter; }
 
 	Gdiplus::GdiplusStartupInput startupInput;
-	return Gdiplus::GdiplusStartup(pGdiPlusToken, &startupInput, NULL) == Gdiplus::Status::Ok;
+	return Gdiplus::GdiplusStartup(pGdiPlusToken, &startupInput, NULL);
 }
 
 // Creates a popup menu for the system tray
@@ -850,15 +632,15 @@ BOOL CreateTrayContextMenu(HMENU* pMenu)
 	);
 	AppendMenu(*pMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
 	AppendMenu(*pMenu,
-		MF_STRING | (g_appSettings.whitelistEnabled ? MF_CHECKED : MF_UNCHECKED),
+		MF_STRING | (Settings::isWhitelistEnabled ? MF_CHECKED : MF_UNCHECKED),
 		IDM_TRAY_TOGGLE_WHITELIST, _T("Use whitelist")
 	);
 	AppendMenu(*pMenu,
-		MF_STRING | (g_appSettings.whitelistEnabled ? 0 : MF_GRAYED),
+		MF_STRING | (Settings::isWhitelistEnabled ? 0 : MF_GRAYED),
 		IDM_TRAY_EDIT_WHITELIST, _T("Edit Whitelist")
 	);
 	AppendMenu(*pMenu,
-		MF_STRING | (g_appSettings.notificationsEnabled ? MF_CHECKED : MF_UNCHECKED),
+		MF_STRING | (Settings::isNotificationsEnabled ? MF_CHECKED : MF_UNCHECKED),
 		IDM_TRAY_TOGGLE_NOTIFICATIONS, _T("Show notifications")
 	);
 	AppendMenu(*pMenu, MF_SEPARATOR, IDM_TRAY_SEPARATOR, NULL);
@@ -891,20 +673,6 @@ BOOL ShowTrayContextMenu(HWND hWnd)
 		return TRUE;
 	}
 	return FALSE;
-}
-
-// Checks if the required time has elapsed since the last trigger time
-BOOL IsTimeElapsed(ULONGLONG ulRequiredElapsedTime)
-{
-	static ULONGLONG ulPreviousTriggerTime{};
-	ULONGLONG ulCurrentSystemTime = GetTickCount64();
-
-	if (ulCurrentSystemTime < ulRequiredElapsedTime + ulPreviousTriggerTime) {
-		return FALSE;
-	}
-	ulPreviousTriggerTime = ulCurrentSystemTime;
-
-	return TRUE;
 }
 
 // Attempts to open the clipboard with retry logic on access denial
@@ -945,8 +713,8 @@ BOOL CheckTextCorrectness(LPCTSTR lpcszText)
 HWND CreateDummyWindow(HINSTANCE hInstance)
 {
 	return CreateWindow(
-		MAIN_CLASS_NAME,
-		MAIN_NAME,
+		Settings::MainClassName,
+		Settings::MainName,
 		WS_POPUP,  // Invisible but valid parent
 		0, 0, 0, 0,
 		(HWND)NULL, (HMENU)NULL, hInstance, (LPVOID)NULL
@@ -959,7 +727,7 @@ ATOM RegisterWindowClass(HINSTANCE hInstance, WNDCLASSEX* wcex)
 	wcex->cbSize = sizeof(WNDCLASSEX);
 	wcex->lpfnWndProc = WndProc;                      // Window procedure
 	wcex->hInstance = hInstance;                      // App instance
-	wcex->lpszClassName = MAIN_CLASS_NAME;            // Class name
+	wcex->lpszClassName = Settings::MainClassName;  // Class name
 	wcex->hIconSm = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_MAIN_ICON));
 
 	return RegisterClassEx(wcex);
@@ -982,22 +750,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 	case WM_CLIPBOARDUPDATE:
 	{
+		static Debouncer debouncer{ 50 };
 		static const UINT uMaxFormatStringLength = 64;
 		static TCHAR szClipboardFormatBuffer[uMaxFormatStringLength];
-		const ULONGLONG ulMinTimeBetweenUpdates = 50; // 50ms
 
 		// Debounce
-		if (!IsTimeElapsed(ulMinTimeBetweenUpdates)) {
-			break;
-		}
+		if (!debouncer.ShouldProcess()) { break; }
 
 		if (!TryOpenClipboard()) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_ERROR,
-				Fmt(_T("Clipboard Error")),
-				Fmt(_T("Failed to access clipboard." EOL_ "%s"),
-					ErrorToText(GetLastError()))
-			);
+			BalloonNotifier{
+				{ _T("System Error") },
+				{ _T("Failed to access clipboard." EOL_ "%s"), EMC_(GetLastError()) }
+			}.ShowError(&notifyIconData);
 			break;
 		}
 
@@ -1009,7 +773,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 
 		// Checks if the 'Restrict to System' option is enabled
-		if (g_appSettings.whitelistEnabled == TRUE) {
+		if (Settings::isWhitelistEnabled == TRUE) {
 			if (!IsStringWhitelisted(cszClipboardOwner)) {
 				CloseClipboard();
 				break;
@@ -1018,30 +782,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 		// Helper function for error cases
 		const auto HandleClipboardError = [&](LPCTSTR szTitle, LPCTSTR szMessage) {
-			if (g_appSettings.notificationsEnabled) {
-				ShowBalloonNotification(
-					&notifyIconData, NIIF_ERROR,
-					Fmt(szTitle),
-					Fmt(_T("%s." EOL_ "%s"),
-						szMessage, ErrorToText(GetLastError()))
-				);
+			if (Settings::isNotificationsEnabled) {
+				BalloonNotifier{
+					{ szTitle },
+					{ _T("%s." EOL_ "%s"), EMC_(GetLastError()) }
+				}.ShowError(&notifyIconData);
 			}
 			CloseClipboard();
 			nExitCode = -1;
 			DestroyWindow(hWnd);
-			};
+		};
 
 		// Helper function for success notifications
 		const auto ShowStatusNotification = [&](LPCTSTR szTitle) {
-			if (g_appSettings.notificationsEnabled) {
-				ShowBalloonNotification(
-					&notifyIconData, NIIF_INFO | NIIF_USER | NIIF_LARGE_ICON,
-					Fmt(szTitle),
-					Fmt(_T("Owner:  %s" EOL_ "Type:  %s"),
-						cszClipboardOwner, szClipboardFormatBuffer)
-				);
+			if (Settings::isNotificationsEnabled) {
+				BalloonNotifier{
+					{ szTitle },
+					{ _T("Owner:  %s" EOL_ "Type:  %s"), cszClipboardOwner, szClipboardFormatBuffer }
+				}.ShowInfo(&notifyIconData);
 			}
-			};
+		};
 
 		ClipboardResult clipboardResult = 
 			HandleClipboardData(szClipboardFormatBuffer, uMaxFormatStringLength);
@@ -1081,114 +841,91 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
 			if (wCommandId == IDM_TRAY_OPEN_FOLDER) {
 				if (!OpenFolderInExplorer()) {
-					ShowBalloonNotification(
-						&notifyIconData, NIIF_WARNING,
-						Fmt(_T("Explorer Error")),
-						Fmt(_T("Failed to open folder in File Explorer." EOL_ "%s"),
-							ErrorToText(GetLastError()))
-					);
+					BalloonNotifier{
+						{ _T("System Error") },
+						{ _T("Failed to open folder in File Explorer." EOL_ "%s"), EMC_(GetLastError()) }
+					}.ShowWarning(&notifyIconData);
 				}
 				break;
 			}
 
 			if (wCommandId == IDM_TRAY_TOGGLE_WHITELIST) {
 				UpdateSetting(IniConfig::WHITELIST, IniConfig::Whitelist::ENABLED,
-					(INT)!g_appSettings.whitelistEnabled);
+					(INT)!Settings::isWhitelistEnabled);
 				break;
 			}
 
 			if (wCommandId == IDM_TRAY_EDIT_WHITELIST) {
-				// Initialize dialog parameters with initial dialog text and its buffer max size
+				// Initialize dialog parameters with initial dialog text and its buffer size
 				DialogParams params{  // Copy will be accessible via GWLP_USERDATA
-					g_appSettings.processWhitelist, g_appSettings.MAX_WHITELIST_LENGTH
+					Settings::procWhiteList, Settings::WhiteListMaxChars
 				};
 
 				// Create and show the custom dialog, passing the parameters
 				HWND hDialog = ShowCustomDialog(hWnd, &params);
 				if (!hDialog) {
-					ShowBalloonNotification(
-						&notifyIconData, NIIF_WARNING,
-						Fmt(_T("Dialog Error")),
-						Fmt(_T("Failed to create dialog window." EOL_ "%s"),
-							ErrorToText(GetLastError()))
-					);
+					BalloonNotifier{
+						{ _T("System Error") },
+						{ _T("Failed to create dialog window." EOL_ "%s"), EMC_(GetLastError()) }
+					}.ShowError(&notifyIconData);
 					break;
 				}
 
-				// Apply theme to dialog window
-				ThemeResult themeResult = FollowSystemTheme(hDialog);
-				if (HasFlag(themeResult, ThemeResult::ThemeFailed)) {
-					ShowBalloonNotification(
-						&notifyIconData, NIIF_WARNING,
-						Fmt(_T("Theme Error")),
-						Fmt(_T("Failed to apply system theme."))
-					);
-				}
 				break;
 			}
 
 			if (wCommandId == IDM_TRAY_TOGGLE_NOTIFICATIONS) {
 				UpdateSetting(IniConfig::NOTIFICATIONS, IniConfig::Notifications::ENABLED,
-					(INT)!g_appSettings.notificationsEnabled
+					(INT)!Settings::isNotificationsEnabled
 				);
 				break;
 			}
 		}
 
 		else if (wNotificationCode == 1) {}  // Accelerator (rarely used explicitly)
-
 		else {}  // Control notification
-
 		break;
 	}
 
 	case WM_CREATE:
 	{
-		if (!InitializeGDIPlus(&pGdiPlusToken)) {
-			ShowMessageBoxNotification(
-				hWnd, MB_OK | MB_ICONERROR,
-				Fmt(_T("Initialization Error")),
-				Fmt(_T("Failed to initialize GDI+ library." EOL_ "%s"),
-					ErrorToText(GetLastError()))
-			);
+		Gdiplus::Status gdiStatus = InitializeGDIPlus(&pGdiPlusToken);
+		if (gdiStatus != Gdiplus::Status::Ok) {
+			MessageBoxNotifier{
+				{ _T("GDI+ Error") },
+				{ _T("Failed to initialize GDI+ library." EOL_ "%s"), gdiStatus }
+			}.ShowError(hWnd);
 			return -1;
 		}
 
 		if (!InitializeNotifyIcon(&notifyIconData, hWnd, &hIcon)) {
-			ShowMessageBoxNotification(
-				hWnd, MB_OK | MB_ICONERROR,
-				Fmt(_T("Tray Icon Error")),
-				Fmt(_T("Failed to initialize system tray icon." EOL_ "%s"),
-					ErrorToText(GetLastError()))
-			);
+			MessageBoxNotifier{
+				{ _T("System Error") },
+				{ _T("Failed to initialize system tray icon." EOL_ "%s"), EMC_(GetLastError()) }
+			}.ShowError(hWnd);
 			return -1;
 		}
 
 		if (!AddClipboardFormatListener(hWnd)) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_ERROR,
-				Fmt(_T("Clipboard Error")),
-				Fmt(_T("Failed to register clipboard listener." EOL_ "%s"),
-					ErrorToText(GetLastError()))
-			);
+			BalloonNotifier{
+				{ _T("System Error") },
+				{ _T("Failed to register clipboard listener." EOL_ "%s"), EMC_(GetLastError()) }
+			}.ShowError(&notifyIconData);
 			return -1;
 		}
 
 		if (!CF_PNG) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_WARNING,
-				Fmt(_T("Clipboard Error")),
-				Fmt(_T("PNG format not available."))
-			);
+			BalloonNotifier{
+				{ _T("Clipboard Error") },
+				{ _T("PNG format not available.") }
+			}.ShowWarning(&notifyIconData);
 		}
 
-		ThemeResult themeResult = FollowSystemTheme(hWnd);
-		if (HasFlag(themeResult, ThemeResult::ThemeFailed)) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_WARNING,
-				Fmt(_T("Theme Error")),
-				Fmt(_T("Failed to apply system theme."))
-			);
+		if (!ThemeManager::FollowSystemTheme(hWnd)) {
+			BalloonNotifier{
+				{ _T("System Error") },
+				{ _T("Failed to apply system theme." EOL_ "%s"), EMC_(GetLastError()) }
+			}.ShowWarning(&notifyIconData);
 		}
 
 		break;
@@ -1214,14 +951,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		// Unregister dialog class
 		HINSTANCE hInstance = GetModuleHandle(NULL);
 		if (hInstance) {
-			LPCTSTR className = WhitelistEditDialog::DIALOG_CLASSNAME;
+			LPCTSTR className = DIALOG_CLASSNAME;
 			WNDCLASS wc{};
 			if (GetClassInfo(hInstance, className, &wc)) {
 				UnregisterClass(className, hInstance);
 			}
 		}
 
-		g_hMainWnd = NULL;
 		PostQuitMessage(nExitCode);
 		break;
 	}
@@ -1232,9 +968,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			-1, _T("ImmersiveColorSet"), -1, TRUE) == CSTR_EQUAL)
 		{
 			// Re-apply the correct theme based on current system setting
-			HWND hwndFound = FindWindow(WhitelistEditDialog::DIALOG_CLASSNAME, NULL);
-			if (hwndFound) { FollowSystemTheme(hwndFound); }
+			HWND hwndFound = FindWindow(DIALOG_CLASSNAME, NULL);
+			if (hwndFound) { 
+				PostMessage(hwndFound, WM_APP_CUSTOM_MESSAGE,
+					MAKEWPARAM(ID_THEME_CHANGED, 0),
+					(LPARAM)NULL
+				);
+			}
 		}
+
 		break;
 	}
 
@@ -1250,18 +992,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		case WM_RBUTTONUP:
 		{
 			if (!ShowTrayContextMenu(hWnd)) {
-				ShowBalloonNotification(
-					&notifyIconData, NIIF_ERROR,
-					Fmt(_T("Tray Menu Error")),
-					Fmt(_T("Failed to create system tray context menu." EOL_ "%s"),
-						ErrorToText(GetLastError()))
-				);
+				BalloonNotifier{
+					{ _T("System Error") },
+					{ _T("Failed to create system tray context menu." EOL_ "%s"), EMC_(GetLastError()) }
+				}.ShowError(&notifyIconData);
 				return 1;
 			}
 			break;
 		}
+
 		default: break;
 		}
+
 		break;
 	}
 
@@ -1270,11 +1012,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		WORD wCommandId = LOWORD(wParam);
 
 		if (wCommandId == ID_MULTIPLE_INSTANCES) {
-			ShowBalloonNotification(
-				&notifyIconData, NIIF_WARNING,
-				Fmt(_T("Multiple Instances Warning")),
-				Fmt(_T("Another instance of this application is already running."))
-			);
+			BalloonNotifier{
+				{ _T("Multiple Instances Warning") },
+				{ _T("Another instance of this application is already running.") }
+			}.ShowWarning(&notifyIconData);
 			return 0;
 		}
 		if (wCommandId == ID_DIALOG_RESULT) {
@@ -1301,9 +1042,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		return 1;
 	}
 
-	default:
-		break;
+	default: break;
 	}
+
 	return DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
@@ -1316,20 +1057,27 @@ int WINAPI WinMain(
 	_In_ int nCmdShow)
 {
 	// Create a mutex with no security attributes
-	g_hMutex = CreateMutex(NULL, TRUE, MUTEX_NAME);
-	if (!g_hMutex) {
-		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
-			Fmt(_T("Mutex operation failed")),
-			Fmt(_T("Unable to acquire lock." EOL_ "%s"), ErrorToText(GetLastError())));
+	HANDLE hMutex = CreateMutex(NULL, TRUE, Settings::MutexName);
+	if (!hMutex) {
+		MessageBoxNotifier{
+			{ _T("Mutex Error") },
+			{ _T("Unable to acquire lock." EOL_ "%s"), EMC_(GetLastError()) }
+		}.ShowError(NULL);
+
+		MessageBoxNotifier{
+			{ _T("Mutex Error") },
+			{ _T("Unable to acquire lock."), EMC_(GetLastError()) }
+		}.ShowError(NULL);
+
 		return 1;
 	}
 
 	DWORD dwMutexResult = GetLastError();
 	// If the mutex already exists, another instance is running
 	if (dwMutexResult == ERROR_ALREADY_EXISTS) {
-		g_hMainWnd = FindWindow(MAIN_CLASS_NAME, NULL);
-		if (g_hMainWnd) {
-			PostMessage(g_hMainWnd, WM_APP_CUSTOM_MESSAGE,
+		HWND hWnd = FindWindow(Settings::MainClassName, NULL);
+		if (hWnd) {
+			PostMessage(hWnd, WM_APP_CUSTOM_MESSAGE,
 				MAKEWPARAM(ID_MULTIPLE_INSTANCES, 0), (LPARAM)NULL);
 		}
 		return 0;
@@ -1337,39 +1085,41 @@ int WINAPI WinMain(
 
 	// Read settings if the file exists, or set defaults
 	if (!InitializeDefaultSettings()) {
-		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
-			Fmt(_T("Settings Error")),
-			Fmt(_T("Failed to initialize settings." EOL_ "%s"), ErrorToText(GetLastError())));
+		MessageBoxNotifier{
+			{ _T("Settings Error") },
+			{ _T("Failed to initialize settings." EOL_ "%s"), EMC_(GetLastError()) }
+		}.ShowError(NULL);
 		return 1;
 	}
 
 	// Enable dark mode support
-	if (!EnableDarkModeSupport()) {
-		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONWARNING,
-			Fmt(_T("Theme Error")),
-			Fmt(_T("Failed to enable theme support." EOL_ "%s"), ErrorToText(GetLastError())));
+	if (!ThemeManager::EnableThemeSupport()) {
+		MessageBoxNotifier{
+			{ _T("System Error") },
+			{ _T("Failed to enable theme support." EOL_ "%s"), EMC_(GetLastError()) }
+		}.ShowError(NULL);
 	}
 
 	// Register class
 	WNDCLASSEXW g_wcex{};
 	if (!RegisterWindowClass(hInstance, &g_wcex)) {
-		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
-			Fmt(_T("Window Class Registration Failed")),
-			Fmt(_T("Unable to register window class." EOL_ "%s"),
-				ErrorToText(GetLastError())));
+		MessageBoxNotifier{
+			{ _T("System Error") },
+			{ _T("Unable to register window class." EOL_ "%s"), EMC_(GetLastError()) }
+		}.ShowError(NULL);
 		return 1;
 	}
 
 	// Create window
-	g_hMainWnd = CreateDummyWindow(hInstance);
-	if (!g_hMainWnd) {
-		ShowMessageBoxNotification(NULL, MB_OK | MB_ICONERROR,
-			Fmt(_T("Window Creation Failed")),
-			Fmt(_T("Unable to create main window." EOL_ "%s"),
-				ErrorToText(GetLastError())));
-		if (g_hMutex) {
-			ReleaseMutex(g_hMutex);
-			CloseHandle(g_hMutex);
+	HWND hMainWnd = CreateDummyWindow(hInstance);
+	if (!hMainWnd) {
+		MessageBoxNotifier{
+			{ _T("System Error") },
+			{ _T("Unable to create main window." EOL_ "%s"), EMC_(GetLastError()) }
+		}.ShowError(NULL);
+		if (hMutex) {
+			ReleaseMutex(hMutex);
+			CloseHandle(hMutex);
 		}
 		return 1;
 	}
@@ -1383,12 +1133,12 @@ int WINAPI WinMain(
 	}
 
 	// Cleanup
-	UnregisterClass(MAIN_CLASS_NAME, GetModuleHandle(NULL));
-	if (g_szLastError) { LocalFree(g_szLastError); }
-	if (g_hMutex) {
-		ReleaseMutex(g_hMutex);
-		CloseHandle(g_hMutex);
+	UnregisterClass(Settings::MainClassName, GetModuleHandle(NULL));
+	if (hMutex) {
+		ReleaseMutex(hMutex);
+		CloseHandle(hMutex);
 	}
+	ThemeManager::DisableThemeSupport();
 
 	return 0;
 }

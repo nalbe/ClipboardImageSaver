@@ -1,21 +1,22 @@
-// Windows system headers
-#include <windows.h>
-#include <commctrl.h>
-
-// Standard library headers
-#include <tchar.h>
-
 // Implementation-specific headers
-#include "AppDefine.h"
 #include "EditDialog.h"
+#include "AppDefine.h"
+#include "CustomIncludes\WinApi\ThemeManager.h"  // Dark theme support
+
+// Windows system headers
+#include <commctrl.h>    // Modern controls
 
 // Library links
 #pragma comment(lib, "Comctl32.lib")
 
 
 
+LPCWSTR DIALOG_CLASSNAME  = _T("CISWhitelistEditClass");
+LPCWSTR DIALOG_NAME       = _T("Whitelist Edit");
+
+
 // Anonymous namespace for internal globals
-namespace WhitelistEditDialog
+namespace
 { 
 	// Constants for theming
 	constexpr COLORREF kDarkBg      = 0x202020;  // Dark background (RGB: 32, 32, 32)
@@ -29,9 +30,10 @@ namespace WhitelistEditDialog
 	HWND g_hDialog{};
 	HWND g_hTooltip{};
 }
-using namespace WhitelistEditDialog;
 
 
+
+// Dialog proc
 LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	static HBRUSH hBgBrush{};     // Brush for background
@@ -82,6 +84,7 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	}
+
 	case WM_CTLCOLORBTN:
 	{
 		if (isFlashing and GetDlgCtrlID((HWND)lParam) == IDOK) {
@@ -90,7 +93,10 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	}
+
 	case WM_CTLCOLOREDIT:
+		[[fallthrough]]; // Intentional fallthrough
+
 	case WM_CTLCOLORSTATIC:
 	{
 		if (isDarkTheme) {
@@ -105,10 +111,12 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		return (LRESULT)hBgBrush;
 	}
+
 	case WM_CTLCOLORDLG:
 	{
 		return (INT_PTR)hBgBrush;
 	}
+
 	case WM_ERASEBKGND:
 	{
 		HDC hdc = (HDC)wParam;
@@ -117,6 +125,7 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		FillRect(hdc, &rc, hBgBrush);
 		return TRUE; // Indicate background was handled
 	}
+
 	case WM_DESTROY:
 	{
 		if (hBgBrush) {
@@ -142,33 +151,22 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	}
+
 	case WM_APP_CUSTOM_MESSAGE:
 	{
-		if (LOWORD(wParam) == ID_SYSTEM_THEME) {
-			// Extract and store the theme setting
-			isDarkTheme = HIWORD(wParam);
-			// Extract callback function
-			auto ThemeCallback = (ThemeChangedCallback)lParam;
-			// Pack theme state and error flag into a single DWORD parameter 
-			DWORD packedParams = MAKELPARAM(0, isDarkTheme);  // High 2 bytes: theme state; Low 2 bytes: error flag
-
-			// Enumerate all child windows of hWnd and apply theme changes recursively
-			EnumChildWindows(hWnd, ThemeCallback, (LPARAM)&packedParams);
-			// Manually call the theme change callback for the tooltip control
-			ThemeCallback(g_hTooltip, (LPARAM)&packedParams);
+		if (LOWORD(wParam) == ID_THEME_CHANGED) {
+			ThemeManager::FollowSystemTheme(hWnd, &isDarkTheme);
+			ThemeManager::FollowSystemTheme(g_hTooltip);
 
 			// Select and create the appropriate background brush based on theme
 			if (hBgBrush) { DeleteObject(hBgBrush); }
 			hBgBrush = CreateSolidBrush(isDarkTheme ? kDarkBg : GetSysColor(COLOR_WINDOW));
 			
-			// Force redraw
-			RedrawWindow(hWnd, NULL, NULL,
-				RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
-
-			return packedParams & 0xff;
+			return 0;
 		}
-		return TRUE;
+		return 1;
 	}
+
 	case WM_TIMER:
 	{
 		if (wParam == IDT_DIALOG_ERROR_TIMER) {
@@ -182,6 +180,7 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	}
+
 	case WM_CREATE:
 	{
 		// Select and create a temporary background brush
@@ -255,6 +254,13 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			if (!hControl) { break; }
 			PostMessage(hControl, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
 
+			// Pick theme
+			SendMessage(hWnd, WM_APP_CUSTOM_MESSAGE,
+				MAKEWPARAM(ID_THEME_CHANGED, 0),
+				(LPARAM)NULL
+			);
+
+			// Refresh
 			RedrawWindow(hWnd, NULL, NULL,
 				RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 
@@ -267,8 +273,9 @@ LRESULT CALLBACK DialogProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 		// Error cleanup
 		DestroyWindow(hWnd);
 		g_hDialog = g_hTooltip = NULL;
-		return 1;
+		return -1;
 	}
+
 	default: break;
 	}
 
