@@ -4,7 +4,7 @@
 #include "resource.h"                                    // Resource identifiers
 #include "AppDefine.h"                                   // Application-wide definitions and constants
 #include "EditDialog.h"                                  // Edit dialog window
-#include "CustomIncludes\murmurhash3.h"                  // MurmurHash3 implementation for hashing
+#include "TStringHash.h"                                 // tchar string hash functor
 #include "CustomIncludes\WinApi\ThemeManager.h"          // Dark mode support
 #include "CustomIncludes\WinApi\MessageBoxNotifier.h"    // MessageBox notification handler
 #include "CustomIncludes\WinApi\BalloonNotifier.h"       // BalloonNotification handler
@@ -43,7 +43,7 @@ namespace Settings
 	TCHAR procWhiteList[WhiteListMaxChars];
 	BOOL isNotificationsEnabled{};
 	BOOL isWhitelistEnabled{};
-	std::unordered_set<RawData, MurmurHash3_32> whitelistHashes{};
+	std::unordered_set<tstring, TStringHash> whitelistHashes{};
 	IniFileManager ini{};
 
 	// Application-wide constants for naming and identification
@@ -182,10 +182,7 @@ void UpdateWhitelistCache()
 	Settings::whitelistHashes.clear();
 	LPTSTR szToken = _tcstok_s(szCopy, cszDelim, &szContext);
 	while (szToken) {
-		Settings::whitelistHashes.insert({
-			reinterpret_cast<const PBYTE>(szToken),
-			_tcslen(szToken) * sizeof(TCHAR)
-		});
+		Settings::whitelistHashes.insert(szToken);
 		szToken = _tcstok_s(NULL, cszDelim, &szContext);
 	}
 
@@ -231,17 +228,14 @@ void UpdateSetting(LPCTSTR cszSection, LPCTSTR cszKey, LPTSTR szText, DWORD cchT
 	Settings::ini.WriteString(cszSection, cszKey, szText);
 }
 
-// Function to compute hash of an LPCTSTR and check existence in the whitelist
+// Function to check existence in the whitelist
 BOOL IsStringWhitelisted(LPCTSTR cszText)
 {
 	if (!cszText) { return FALSE; }
 
-	auto it = Settings::whitelistHashes.find({
-		reinterpret_cast<LPCBYTE>(cszText),
-		_tcslen(cszText) * sizeof(TCHAR)
-	});
+	auto it = Settings::whitelistHashes.find(cszText);
 
-	return it != Settings::whitelistHashes.end();  // Check if hash exists in whitelist
+	return it != Settings::whitelistHashes.end();
 }
 
 // Generates a filename string
@@ -772,7 +766,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 			break;
 		}
 
-		// Checks if the 'Restrict to System' option is enabled
+		// Checks if the whitelist option is enabled
 		if (Settings::isWhitelistEnabled == TRUE) {
 			if (!IsStringWhitelisted(cszClipboardOwner)) {
 				CloseClipboard();

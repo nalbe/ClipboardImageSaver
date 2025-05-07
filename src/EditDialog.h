@@ -2,8 +2,6 @@
 
 // Windows system headers
 #include <windows.h>
-
-// Standard library headers
 #include <tchar.h>
 
 
